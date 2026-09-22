@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/atomic"
@@ -60,9 +60,9 @@ type RuntimeGoMatchCore struct {
 
 func NewRuntimeGoMatchCore(logger *zap.Logger, module string, matchRegistry MatchRegistry, router MessageRouter, id uuid.UUID, node, version string, stopped *atomic.Bool, db *sql.DB, env map[string]string, nk runtime.NakamaModule, match runtime.Match) (RuntimeMatchCore, error) {
 	ctx, ctxCancelFn := context.WithCancel(context.Background())
-	ctx = NewRuntimeGoContext(ctx, node, version, env, RuntimeExecutionModeMatch, nil, nil, 0, "", "", nil, "", "", "", "")
-	ctx = context.WithValue(ctx, runtime.RUNTIME_CTX_MATCH_ID, fmt.Sprintf("%v.%v", id.String(), node))
-	ctx = context.WithValue(ctx, runtime.RUNTIME_CTX_MATCH_NODE, node)
+	ctx = NewRuntimeGoContext(ctx, node, version, env, RuntimeExecutionModeMatch, nil, nil, "", 0, "", "", nil, "", "", "", "")
+	ctx = context.WithValue(ctx, runtime.RUNTIME_CTX_MATCH_ID, fmt.Sprintf("%v.%v", id.String(), node)) //nolint:staticcheck
+	ctx = context.WithValue(ctx, runtime.RUNTIME_CTX_MATCH_NODE, node)                                  //nolint:staticcheck
 
 	return &RuntimeGoMatchCore{
 		logger:        logger,
@@ -97,7 +97,7 @@ func NewRuntimeGoMatchCore(logger *zap.Logger, module string, matchRegistry Matc
 	}, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchInit(presenceList *MatchPresenceList, deferMessageFn RuntimeMatchDeferMessageFunction, params map[string]interface{}) (interface{}, int, error) {
+func (r *RuntimeGoMatchCore) MatchInit(presenceList *MatchPresenceList, deferMessageFn RuntimeMatchDeferMessageFunction, params map[string]any) (any, int, error) {
 	state, tickRate, label := r.match.MatchInit(r.ctx, r.runtimeLogger, r.db, r.nk, params)
 
 	if len(label) > MatchLabelMaxBytes {
@@ -116,8 +116,8 @@ func (r *RuntimeGoMatchCore) MatchInit(presenceList *MatchPresenceList, deferMes
 	}
 	r.label.Store(label)
 
-	r.ctx = context.WithValue(r.ctx, runtime.RUNTIME_CTX_MATCH_TICK_RATE, tickRate)
-	r.ctx = context.WithValue(r.ctx, runtime.RUNTIME_CTX_MATCH_LABEL, label)
+	r.ctx = context.WithValue(r.ctx, runtime.RUNTIME_CTX_MATCH_TICK_RATE, tickRate) //nolint:staticcheck
+	r.ctx = context.WithValue(r.ctx, runtime.RUNTIME_CTX_MATCH_LABEL, label)        //nolint:staticcheck
 
 	r.deferMessageFn = deferMessageFn
 	r.presenceList = presenceList
@@ -125,7 +125,8 @@ func (r *RuntimeGoMatchCore) MatchInit(presenceList *MatchPresenceList, deferMes
 	return state, tickRate, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchJoinAttempt(tick int64, state interface{}, userID, sessionID uuid.UUID, username string, sessionExpiry int64, vars map[string]string, clientIP, clientPort, node string, metadata map[string]string) (interface{}, bool, string, error) {
+//nolint:staticcheck
+func (r *RuntimeGoMatchCore) MatchJoinAttempt(tick int64, state any, userID, sessionID uuid.UUID, username string, sessionExpiry int64, vars map[string]string, clientIP, clientPort, node string, metadata map[string]string) (any, bool, string, error) {
 	presence := &MatchPresence{
 		Node:      node,
 		UserID:    userID,
@@ -152,7 +153,7 @@ func (r *RuntimeGoMatchCore) MatchJoinAttempt(tick int64, state interface{}, use
 	return newState, allow, reason, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchJoin(tick int64, state interface{}, joins []*MatchPresence) (interface{}, error) {
+func (r *RuntimeGoMatchCore) MatchJoin(tick int64, state any, joins []*MatchPresence) (any, error) {
 	presences := make([]runtime.Presence, len(joins))
 	for i, join := range joins {
 		presences[i] = runtime.Presence(join)
@@ -162,7 +163,7 @@ func (r *RuntimeGoMatchCore) MatchJoin(tick int64, state interface{}, joins []*M
 	return newState, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchLeave(tick int64, state interface{}, leaves []*MatchPresence) (interface{}, error) {
+func (r *RuntimeGoMatchCore) MatchLeave(tick int64, state any, leaves []*MatchPresence) (any, error) {
 	presences := make([]runtime.Presence, len(leaves))
 	for i, leave := range leaves {
 		presences[i] = runtime.Presence(leave)
@@ -172,11 +173,11 @@ func (r *RuntimeGoMatchCore) MatchLeave(tick int64, state interface{}, leaves []
 	return newState, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchLoop(tick int64, state interface{}, inputCh <-chan *MatchDataMessage) (interface{}, error) {
+func (r *RuntimeGoMatchCore) MatchLoop(tick int64, state any, inputCh <-chan *MatchDataMessage) (any, error) {
 	// Drain the input queue into a slice.
 	size := len(inputCh)
 	messages := make([]runtime.MatchData, size)
-	for i := 0; i < size; i++ {
+	for i := range size {
 		msg := <-inputCh
 		messages[i] = runtime.MatchData(msg)
 	}
@@ -185,17 +186,17 @@ func (r *RuntimeGoMatchCore) MatchLoop(tick int64, state interface{}, inputCh <-
 	return newState, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchTerminate(tick int64, state interface{}, graceSeconds int) (interface{}, error) {
+func (r *RuntimeGoMatchCore) MatchTerminate(tick int64, state any, graceSeconds int) (any, error) {
 	newState := r.match.MatchTerminate(r.ctx, r.runtimeLogger, r.db, r.nk, r, tick, state, graceSeconds)
 	return newState, nil
 }
 
-func (r *RuntimeGoMatchCore) MatchSignal(tick int64, state interface{}, data string) (interface{}, string, error) {
+func (r *RuntimeGoMatchCore) MatchSignal(tick int64, state any, data string) (any, string, error) {
 	newState, responseData := r.match.MatchSignal(r.ctx, r.runtimeLogger, r.db, r.nk, r, tick, state, data)
 	return newState, responseData, nil
 }
 
-func (r *RuntimeGoMatchCore) GetState(state interface{}) (string, error) {
+func (r *RuntimeGoMatchCore) GetState(state any) (string, error) {
 	return fmt.Sprintf("%+v", state), nil
 }
 
@@ -391,6 +392,6 @@ func (r *RuntimeGoMatchCore) MatchLabelUpdate(label string) error {
 	r.label.Store(label)
 
 	// This must be executed from inside a match call so safe to update here.
-	r.ctx = context.WithValue(r.ctx, runtime.RUNTIME_CTX_MATCH_LABEL, label)
+	r.ctx = context.WithValue(r.ctx, runtime.RUNTIME_CTX_MATCH_LABEL, label) //nolint:staticcheck
 	return nil
 }

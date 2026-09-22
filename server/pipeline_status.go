@@ -15,23 +15,23 @@
 package server
 
 import (
-	"strconv"
-	"strings"
+	"context"
+	"fmt"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *rtapi.Envelope) (bool, *rtapi.Envelope) {
+func (p *Pipeline) statusFollow(ctx context.Context, logger *zap.Logger, session Session, envelope *rtapi.Envelope) (bool, *rtapi.Envelope) {
 	incoming := envelope.GetStatusFollow()
 
 	if len(incoming.UserIds) == 0 && len(incoming.Usernames) == 0 {
 		out := &rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Status{Status: &rtapi.Status{
 			Presences: make([]*rtapi.UserPresence, 0),
 		}}}
-		session.Send(out, true)
+		_ = session.Send(out, true)
 
 		return true, nil
 	}
@@ -41,7 +41,7 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 	for _, uid := range incoming.UserIds {
 		userID, err := uuid.FromString(uid)
 		if err != nil {
-			session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 				Code:    int32(rtapi.Error_BAD_INPUT),
 				Message: "Invalid user identifier",
 			}}}, true)
@@ -60,7 +60,7 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 	uniqueUsernames := make(map[string]struct{}, len(incoming.Usernames))
 	for _, username := range incoming.Usernames {
 		if username == "" {
-			session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 				Code:    int32(rtapi.Error_BAD_INPUT),
 				Message: "Invalid username",
 			}}}, true)
@@ -78,7 +78,7 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 		out := &rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Status{Status: &rtapi.Status{
 			Presences: make([]*rtapi.UserPresence, 0),
 		}}}
-		session.Send(out, true)
+		_ = session.Send(out, true)
 
 		return true, out
 	}
@@ -86,19 +86,17 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 	followUserIDs := make(map[uuid.UUID]struct{}, len(uniqueUserIDs)+len(uniqueUsernames))
 	foundUsernames := make(map[string]struct{}, len(uniqueUsernames))
 	if len(uniqueUsernames) == 0 {
-		params := make([]interface{}, 0, len(uniqueUserIDs))
-		statements := make([]string, 0, len(uniqueUserIDs))
+		ids := make([]uuid.UUID, 0, len(uniqueUserIDs))
 		for userID := range uniqueUserIDs {
-			params = append(params, userID)
-			statements = append(statements, "$"+strconv.Itoa(len(params))+"::UUID")
+			ids = append(ids, userID)
 		}
 
 		// See if all the users exist.
-		query := "SELECT id FROM users WHERE id IN (" + strings.Join(statements, ", ") + ")"
-		rows, err := p.db.QueryContext(session.Context(), query, params...)
+		query := "SELECT id FROM users WHERE id = ANY($1::UUID[])"
+		rows, err := p.db.QueryContext(ctx, query, ids)
 		if err != nil {
 			logger.Error("Error checking users in status follow", zap.Error(err))
-			session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 				Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
 				Message: "Could not check users",
 			}}}, true)
@@ -122,31 +120,31 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 	} else {
 		query := "SELECT id, username FROM users WHERE "
 
-		params := make([]interface{}, 0, len(uniqueUserIDs))
-		statements := make([]string, 0, len(uniqueUserIDs))
+		params := make([]any, 0, 2)
+		ids := make([]uuid.UUID, 0, len(uniqueUserIDs))
 		for userID := range uniqueUserIDs {
-			params = append(params, userID)
-			statements = append(statements, "$"+strconv.Itoa(len(params))+"::UUID")
+			ids = append(ids, userID)
 		}
-		if len(statements) != 0 {
-			query += "id IN (" + strings.Join(statements, ", ") + ")"
-			statements = make([]string, 0, len(uniqueUsernames))
+		if len(ids) != 0 {
+			params = append(params, ids)
+			query += fmt.Sprintf("id = ANY($%d::UUID[])", len(params))
 		}
 
+		usernames := make([]string, 0, len(uniqueUsernames))
 		for username := range uniqueUsernames {
-			params = append(params, username)
-			statements = append(statements, "$"+strconv.Itoa(len(params)))
+			usernames = append(usernames, username)
 		}
 		if len(uniqueUserIDs) != 0 {
 			query += " OR "
 		}
-		query += "username IN (" + strings.Join(statements, ", ") + ")"
+		params = append(params, usernames)
+		query += fmt.Sprintf("username = ANY($%d::text[])", len(params))
 
 		// See if all the users exist.
-		rows, err := p.db.QueryContext(session.Context(), query, params...)
+		rows, err := p.db.QueryContext(ctx, query, params...)
 		if err != nil {
 			logger.Error("Error checking users in status follow", zap.Error(err))
-			session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 				Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
 				Message: "Could not check users",
 			}}}, true)
@@ -158,7 +156,7 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 			if err := rows.Scan(&id, &username); err != nil {
 				_ = rows.Close()
 				logger.Error("Error scanning users in status follow", zap.Error(err))
-				session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+				_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 					Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
 					Message: "Could not check users",
 				}}}, true)
@@ -217,17 +215,17 @@ func (p *Pipeline) statusFollow(logger *zap.Logger, session Session, envelope *r
 	out := &rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Status{Status: &rtapi.Status{
 		Presences: presences,
 	}}}
-	session.Send(out, true)
+	_ = session.Send(out, true)
 
 	return true, out
 }
 
-func (p *Pipeline) statusUnfollow(logger *zap.Logger, session Session, envelope *rtapi.Envelope) (bool, *rtapi.Envelope) {
+func (p *Pipeline) statusUnfollow(ctx context.Context, logger *zap.Logger, session Session, envelope *rtapi.Envelope) (bool, *rtapi.Envelope) {
 	incoming := envelope.GetStatusUnfollow()
 
 	if len(incoming.UserIds) == 0 {
 		out := &rtapi.Envelope{Cid: envelope.Cid}
-		session.Send(out, true)
+		_ = session.Send(out, true)
 
 		return true, out
 	}
@@ -236,7 +234,7 @@ func (p *Pipeline) statusUnfollow(logger *zap.Logger, session Session, envelope 
 	for _, uid := range incoming.UserIds {
 		userID, err := uuid.FromString(uid)
 		if err != nil {
-			session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+			_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 				Code:    int32(rtapi.Error_BAD_INPUT),
 				Message: "Invalid user identifier",
 			}}}, true)
@@ -252,39 +250,39 @@ func (p *Pipeline) statusUnfollow(logger *zap.Logger, session Session, envelope 
 	p.statusRegistry.Unfollow(session.ID(), userIDs)
 
 	out := &rtapi.Envelope{Cid: envelope.Cid}
-	session.Send(out, true)
+	_ = session.Send(out, true)
 
 	return true, out
 }
 
-func (p *Pipeline) statusUpdate(logger *zap.Logger, session Session, envelope *rtapi.Envelope) (bool, *rtapi.Envelope) {
+func (p *Pipeline) statusUpdate(ctx context.Context, logger *zap.Logger, session Session, envelope *rtapi.Envelope) (bool, *rtapi.Envelope) {
 	incoming := envelope.GetStatusUpdate()
 
 	if incoming.Status == nil {
 		p.tracker.Untrack(session.ID(), PresenceStream{Mode: StreamModeStatus, Subject: session.UserID()}, session.UserID())
 
 		out := &rtapi.Envelope{Cid: envelope.Cid}
-		session.Send(out, true)
+		_ = session.Send(out, true)
 
 		return true, out
 	}
 
 	if len(incoming.Status.Value) > 2048 {
-		session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+		_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 			Code:    int32(rtapi.Error_BAD_INPUT),
 			Message: "Status must be 2048 characters or less",
 		}}}, true)
 		return false, nil
 	}
 
-	success := p.tracker.Update(session.Context(), session.ID(), PresenceStream{Mode: StreamModeStatus, Subject: session.UserID()}, session.UserID(), PresenceMeta{
+	success := p.tracker.Update(ctx, session.ID(), PresenceStream{Mode: StreamModeStatus, Subject: session.UserID()}, session.UserID(), PresenceMeta{
 		Format:   session.Format(),
 		Username: session.Username(),
 		Status:   incoming.Status.Value,
-	}, false)
+	})
 
 	if !success {
-		session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+		_ = session.Send(&rtapi.Envelope{Cid: envelope.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 			Code:    int32(rtapi.Error_RUNTIME_EXCEPTION),
 			Message: "Error tracking status update",
 		}}}, true)
@@ -292,7 +290,7 @@ func (p *Pipeline) statusUpdate(logger *zap.Logger, session Session, envelope *r
 	}
 
 	out := &rtapi.Envelope{Cid: envelope.Cid}
-	session.Send(out, true)
+	_ = session.Send(out, true)
 
 	return true, out
 }

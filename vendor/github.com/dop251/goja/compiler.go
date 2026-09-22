@@ -2,8 +2,9 @@ package goja
 
 import (
 	"fmt"
-	"github.com/dop251/goja/token"
 	"sort"
+
+	"github.com/dop251/goja/token"
 
 	"github.com/dop251/goja/ast"
 	"github.com/dop251/goja/file"
@@ -63,9 +64,11 @@ type srcMapItem struct {
 	srcPos int
 }
 
+// Program is an internal, compiled representation of code which is produced by the Compile function.
+// This representation is not linked to a runtime in any way and can be used concurrently.
+// It is always preferable to use a Program over a string when running code as it skips the compilation step.
 type Program struct {
-	code   []instruction
-	values []Value
+	code []instruction
 
 	funcName unistring.String
 	src      *file.File
@@ -85,6 +88,8 @@ type compiler struct {
 	ctxVM  *vm // VM in which an eval() code is compiled
 
 	codeScratchpad []instruction
+
+	stringCache map[unistring.String]Value
 }
 
 type binding struct {
@@ -381,6 +386,29 @@ func (c *compiler) popScope() {
 	c.scope = c.scope.outer
 }
 
+func (c *compiler) emitLiteralString(s String) {
+	key := s.string()
+	if c.stringCache == nil {
+		c.stringCache = make(map[unistring.String]Value)
+	}
+	internVal := c.stringCache[key]
+	if internVal == nil {
+		c.stringCache[key] = s
+		internVal = s
+	}
+
+	c.emit(loadVal{internVal})
+}
+
+func (c *compiler) emitLiteralValue(v Value) {
+	if s, ok := v.(String); ok {
+		c.emitLiteralString(s)
+		return
+	}
+
+	c.emit(loadVal{v})
+}
+
 func newCompiler() *compiler {
 	c := &compiler{
 		p: &Program{},
@@ -391,23 +419,11 @@ func newCompiler() *compiler {
 	return c
 }
 
-func (p *Program) defineLiteralValue(val Value) uint32 {
-	for idx, v := range p.values {
-		if v.SameAs(val) {
-			return uint32(idx)
-		}
-	}
-	idx := uint32(len(p.values))
-	p.values = append(p.values, val)
-	return idx
-}
-
 func (p *Program) dumpCode(logger func(format string, args ...interface{})) {
 	p._dumpCode("", logger)
 }
 
 func (p *Program) _dumpCode(indent string, logger func(format string, args ...interface{})) {
-	logger("values: %+v", p.values)
 	dumpInitFields := func(initFields *Program) {
 		i := indent + ">"
 		logger("%s ---- init_fields:", i)
@@ -418,12 +434,8 @@ func (p *Program) _dumpCode(indent string, logger func(format string, args ...in
 		logger("%s %d: %T(%v)", indent, pc, ins, ins)
 		var prg *Program
 		switch f := ins.(type) {
-		case *newFunc:
-			prg = f.prg
-		case *newArrowFunc:
-			prg = f.prg
-		case *newMethod:
-			prg = f.prg
+		case newFuncInstruction:
+			prg = f.getPrg()
 		case *newDerivedClass:
 			if f.initFields != nil {
 				dumpInitFields(f.initFields)
@@ -537,7 +549,7 @@ func (s *scope) addBinding(offset int) *binding {
 func (s *scope) bindNameLexical(name unistring.String, unique bool, offset int) (*binding, bool) {
 	if b := s.boundNames[name]; b != nil {
 		if unique {
-			s.c.throwSyntaxError(offset, "Identifier '%s' has already been declared", name)
+			s.c.throwSyntaxErrorf(offset, "Identifier '%s' has already been declared", name)
 		}
 		return b, false
 	}
@@ -638,6 +650,8 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 								*ap = loadThisStash(idx)
 							case initStack:
 								*ap = initStash(idx)
+							case initStackP:
+								*ap = initStashP(idx)
 							case resolveThisStack:
 								*ap = resolveThisStash(idx)
 							case _ret:
@@ -654,6 +668,8 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 								*ap = loadStash(idx)
 							case initStack:
 								*ap = initStash(idx)
+							case initStackP:
+								*ap = initStashP(idx)
 							default:
 								s.c.assert(false, s.c.p.sourceOffset(pc), "Unsupported instruction for 'this'")
 							}
@@ -722,6 +738,8 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 							case loadStack:
 								*ap = loadThisStack{}
 							case initStack:
+								// no-op
+							case initStackP:
 								// no-op
 							case resolveThisStack:
 								// no-op
@@ -982,9 +1000,8 @@ func (c *compiler) compile(in *ast.Program, strict, inGlobal bool, evalVm *vm) {
 		c.popScope()
 	}
 
-	c.p.code = append(c.p.code, halt)
-
 	scope.finaliseVarAlloc(0)
+	c.stringCache = nil
 }
 
 func (c *compiler) compileDeclList(v []*ast.VariableDeclaration, inFunc bool) {
@@ -1024,8 +1041,26 @@ func (c *compiler) createFunctionBindings(funcs []*ast.FunctionDeclaration) {
 	s := c.scope
 	if s.outer != nil {
 		unique := !s.isFunction() && !s.variable && s.strict
-		for _, decl := range funcs {
-			s.bindNameLexical(decl.Function.Name.Name, unique, int(decl.Function.Name.Idx1())-1)
+		if !unique {
+			hasNonStandard := false
+			for _, decl := range funcs {
+				if !decl.Function.Async && !decl.Function.Generator {
+					s.bindNameLexical(decl.Function.Name.Name, false, int(decl.Function.Name.Idx1())-1)
+				} else {
+					hasNonStandard = true
+				}
+			}
+			if hasNonStandard {
+				for _, decl := range funcs {
+					if decl.Function.Async || decl.Function.Generator {
+						s.bindNameLexical(decl.Function.Name.Name, true, int(decl.Function.Name.Idx1())-1)
+					}
+				}
+			}
+		} else {
+			for _, decl := range funcs {
+				s.bindNameLexical(decl.Function.Name.Name, true, int(decl.Function.Name.Idx1())-1)
+			}
 		}
 	} else {
 		for _, decl := range funcs {
@@ -1091,7 +1126,7 @@ func (c *compiler) createBindings(target ast.Expression, createIdBinding func(na
 			case *ast.PropertyKeyed:
 				c.createBindings(prop.Value, createIdBinding)
 			default:
-				c.throwSyntaxError(int(target.Idx0()-1), "unsupported property type in ObjectPattern: %T", prop)
+				c.throwSyntaxErrorf(int(target.Idx0()-1), "unsupported property type in ObjectPattern: %T", prop)
 			}
 		}
 		if target.Rest != nil {
@@ -1109,7 +1144,7 @@ func (c *compiler) createBindings(target ast.Expression, createIdBinding func(na
 	case *ast.AssignExpression:
 		c.createBindings(target.Left, createIdBinding)
 	default:
-		c.throwSyntaxError(int(target.Idx0()-1), "unsupported binding target: %T", target)
+		c.throwSyntaxErrorf(int(target.Idx0()-1), "unsupported binding target: %T", target)
 	}
 }
 
@@ -1152,7 +1187,7 @@ func (c *compiler) createLexicalIdBindingFuncBody(name unistring.String, isConst
 	parentBinding := paramScope.boundNames[name]
 	if parentBinding != nil {
 		if parentBinding != calleeBinding && (name != "arguments" || !paramScope.argsNeeded) {
-			c.throwSyntaxError(offset, "Identifier '%s' has already been declared", name)
+			c.throwSyntaxErrorf(offset, "Identifier '%s' has already been declared", name)
 		}
 	}
 	b, _ := c.scope.bindNameLexical(name, true, offset)
@@ -1202,6 +1237,8 @@ func (c *compiler) compileLexicalDeclarationsFuncBody(list []ast.Statement, call
 					c.createLexicalIdBindingFuncBody(name, isConst, offset, calleeBinding)
 				})
 			}
+		} else if cls, ok := st.(*ast.ClassDeclaration); ok {
+			c.createLexicalIdBindingFuncBody(cls.Class.Name.Name, false, int(cls.Class.Name.Idx)-1, calleeBinding)
 		}
 	}
 }
@@ -1222,6 +1259,12 @@ func (c *compiler) compileFunction(v *ast.FunctionDeclaration) {
 }
 
 func (c *compiler) compileStandaloneFunctionDecl(v *ast.FunctionDeclaration) {
+	if v.Function.Async {
+		c.throwSyntaxError(int(v.Idx0())-1, "Async functions can only be declared at top level or inside a block.")
+	}
+	if v.Function.Generator {
+		c.throwSyntaxError(int(v.Idx0())-1, "Generators can only be declared at top level or inside a block.")
+	}
 	if c.scope.strict {
 		c.throwSyntaxError(int(v.Idx0())-1, "In strict mode code, functions can only be declared at top level or inside a block.")
 	}
@@ -1232,7 +1275,17 @@ func (c *compiler) emit(instructions ...instruction) {
 	c.p.code = append(c.p.code, instructions...)
 }
 
-func (c *compiler) throwSyntaxError(offset int, format string, args ...interface{}) {
+func (c *compiler) throwSyntaxError(offset int, msg string) {
+	panic(&CompilerSyntaxError{
+		CompilerError: CompilerError{
+			File:    c.p.src,
+			Offset:  offset,
+			Message: msg,
+		},
+	})
+}
+
+func (c *compiler) throwSyntaxErrorf(offset int, format string, args ...interface{}) {
 	panic(&CompilerSyntaxError{
 		CompilerError: CompilerError{
 			File:    c.p.src,
@@ -1296,7 +1349,9 @@ func (c *compiler) enterDummyMode() (leaveFunc func()) {
 			breaking: savedBlock.breaking,
 		}
 	}
-	c.p = &Program{}
+	c.p = &Program{
+		src: c.p.src,
+	}
 	c.newScope()
 	return func() {
 		c.block, c.p = savedBlock, savedProgram
@@ -1312,12 +1367,12 @@ func (c *compiler) compileStatementDummy(statement ast.Statement) {
 
 func (c *compiler) assert(cond bool, offset int, msg string, args ...interface{}) {
 	if !cond {
-		c.throwSyntaxError(offset, "Compiler bug: "+msg, args...)
+		c.throwSyntaxErrorf(offset, "Compiler bug: "+msg, args...)
 	}
 }
 
 func privateIdString(desc unistring.String) unistring.String {
-	return asciiString("#").concat(stringValueFromRaw(desc)).string()
+	return asciiString("#").Concat(stringValueFromRaw(desc)).string()
 }
 
 type privateName struct {
@@ -1379,7 +1434,7 @@ func (s *classScope) declarePrivateId(name unistring.String, kind ast.PropertyKi
 				}
 			}
 		}
-		s.c.throwSyntaxError(offset, "Identifier '#%s' has already been declared", name)
+		s.c.throwSyntaxErrorf(offset, "Identifier '#%s' has already been declared", name)
 		panic("unreachable")
 	}
 	var env *privateEnvRegistry
@@ -1438,6 +1493,6 @@ func (c *compiler) resolvePrivateName(name unistring.String, offset int) (*resol
 			}
 		}
 	}
-	c.throwSyntaxError(offset, "Private field '#%s' must be declared in an enclosing class", name)
+	c.throwSyntaxErrorf(offset, "Private field '#%s' must be declared in an enclosing class", name)
 	panic("unreachable")
 }

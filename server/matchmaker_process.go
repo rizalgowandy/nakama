@@ -131,8 +131,8 @@ func (m *LocalMatchmaker) processDefault(activeIndexCount int, activeIndexesCopy
 		for hitCounter, hit := range blugeMatches.Hits {
 			hitIndex, ok := indexesCopy[hit.ID]
 			if !ok {
-				// Ticket did not exist, should not happen.
-				m.logger.Warn("matchmaker process missing index", zap.String("ticket", hit.ID))
+				// Ticket did not exist, can happen if tickets were added to bluge but are not part of the
+				// current working snapshot of indexCopy tickets. Skip it.
 				continue
 			}
 
@@ -299,7 +299,7 @@ func (m *LocalMatchmaker) processDefault(activeIndexCount int, activeIndexesCopy
 				currentMatchedEntries := append(foundCombo, activeIndex.Entries...)
 
 				// Remove the found combos from currently tracked list.
-				entryCombos = append(entryCombos[:foundComboIdx], entryCombos[foundComboIdx+1:]...)
+				entryCombos = append(entryCombos[:foundComboIdx], entryCombos[foundComboIdx+1:]...) //nolint:staticcheck
 
 				matchedEntries = append(matchedEntries, currentMatchedEntries)
 
@@ -333,7 +333,7 @@ func (m *LocalMatchmaker) processDefault(activeIndexCount int, activeIndexesCopy
 	return matchedEntries, expiredActiveIndexes
 }
 
-func (m *LocalMatchmaker) processCustom(activeIndexesCopy map[string]*MatchmakerIndex, indexCount int, indexesCopy map[string]*MatchmakerIndex) ([][]*MatchmakerEntry, []string) {
+func (m *LocalMatchmaker) processOverride(activeIndexesCopy map[string]*MatchmakerIndex, indexCount int, indexesCopy map[string]*MatchmakerIndex) ([][]*MatchmakerEntry, []string) {
 	matchedEntries := make([][]*MatchmakerEntry, 0, 5)
 	expiredActiveIndexes := make([]string, 0, 10)
 
@@ -431,8 +431,8 @@ func (m *LocalMatchmaker) processCustom(activeIndexesCopy map[string]*Matchmaker
 
 			hitIndex, ok := indexesCopy[hit.ID]
 			if !ok {
-				// Ticket did not exist, should not happen.
-				m.logger.Warn("matchmaker process missing index", zap.String("ticket", hit.ID))
+				// Ticket did not exist, can happen if tickets were added to bluge but are not part of the
+				// current working snapshot of indexCopy tickets. Skip it.
 				continue
 			}
 
@@ -507,7 +507,7 @@ func (m *LocalMatchmaker) processCustom(activeIndexesCopy map[string]*Matchmaker
 			sessionIDs := make(map[string]struct{}, index.MaxCount-index.Count)
 			parsedQueries := make(map[string]bluge.Query, index.MaxCount-index.Count)
 			for _, hitIndex := range hitIndexes {
-				for sessionID, _ := range hitIndex.SessionIDs {
+				for sessionID := range hitIndex.SessionIDs {
 					// Check for session ID conflicts.
 					if _, found := sessionIDs[sessionID]; found {
 						sessionIdConflict = true
@@ -572,7 +572,60 @@ func (m *LocalMatchmaker) processCustom(activeIndexesCopy map[string]*Matchmaker
 	// Allow the custom function to determine which of the matches should be formed. All others will be discarded.
 	matchedEntries = m.runtime.matchmakerOverrideFunction(m.ctx, matchedEntries)
 
+	var batchSize int
+	var selectedTickets = map[string]string{}
+	batch := bluge.NewBatch()
+	// Mark tickets as unavailable for further use in this process iteration.
+	for _, matchedEntry := range matchedEntries {
+		for _, ticket := range matchedEntry {
+			if _, found := selectedTickets[ticket.Ticket]; found {
+				continue
+			}
+			selectedTickets[ticket.Ticket] = ticket.Ticket
+			batchSize++
+			batch.Delete(bluge.Identifier(ticket.Ticket))
+		}
+	}
+	if batchSize > 0 {
+		if err := m.indexWriter.Batch(batch); err != nil {
+			m.logger.Error("error deleting matchmaker process entries batch", zap.Error(err))
+		}
+	}
+
 	return matchedEntries, expiredActiveIndexes
+}
+
+func (m *LocalMatchmaker) processCustom(indexesCopy map[string]*MatchmakerIndex) [][]*MatchmakerEntry {
+	if m.active.Load() != 1 {
+		// Index intervals must be marked anyway.
+		for _, index := range indexesCopy {
+			index.Intervals++
+		}
+		return nil
+	}
+
+	entries := make([]*MatchmakerEntry, 0, len(indexesCopy))
+	for _, index := range indexesCopy {
+		index.Intervals++
+
+		entries = append(entries, index.Entries...)
+	}
+
+	matchedEntries := m.runtime.matchmakerProcessorFunction(m.ctx, entries)
+
+	// Allow the custom function to determine which of the matches should be formed. All others will be discarded.
+	var selectedTickets = map[string]string{}
+	// Mark tickets as unavailable for further use in this process iteration.
+	for _, matchedEntry := range matchedEntries {
+		for _, ticket := range matchedEntry {
+			if _, found := selectedTickets[ticket.Ticket]; found {
+				continue
+			}
+			selectedTickets[ticket.Ticket] = ticket.Ticket
+		}
+	}
+
+	return matchedEntries
 }
 
 func combineIndexes(from []*MatchmakerIndex, min, max int) <-chan []*MatchmakerIndex {
@@ -593,7 +646,7 @@ func combineIndexes(from []*MatchmakerIndex, min, max int) <-chan []*MatchmakerI
 
 			combination := make([]*MatchmakerIndex, 0, count)
 			entryCount := 0
-			for element := uint(0); element < length; element++ {
+			for element := range length {
 				// Check if element should be contained in combination by checking if bit 'element' is set in combinationBits.
 				if (combinationBits>>element)&1 == 1 {
 					entryCount = entryCount + from[element].Count

@@ -16,8 +16,9 @@ package server
 
 import (
 	"context"
+	"errors"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/zap"
@@ -27,17 +28,18 @@ import (
 
 func (s *ApiServer) ListChannelMessages(ctx context.Context, in *api.ListChannelMessagesRequest) (*api.ChannelMessageList, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 
 	// Before hook.
 	if fn := s.runtime.BeforeListChannelMessages(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -45,7 +47,7 @@ func (s *ApiServer) ListChannelMessages(ctx context.Context, in *api.ListChannel
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -73,12 +75,12 @@ func (s *ApiServer) ListChannelMessages(ctx context.Context, in *api.ListChannel
 		return nil, status.Error(codes.InvalidArgument, "Invalid channel ID.")
 	}
 
-	messageList, err := ChannelMessagesList(ctx, s.logger, s.db, userID, streamConversionResult.Stream, in.ChannelId, limit, forward, in.Cursor)
-	if err == runtime.ErrChannelCursorInvalid {
+	messageList, err := ChannelMessagesList(ctx, logger, s.db, userID, streamConversionResult.Stream, in.ChannelId, limit, forward, in.Cursor)
+	if errors.Is(err, runtime.ErrChannelCursorInvalid) {
 		return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
-	} else if err == runtime.ErrChannelGroupNotFound {
+	} else if errors.Is(err, runtime.ErrChannelGroupNotFound) {
 		return nil, status.Error(codes.InvalidArgument, "Group not found.")
-	} else if err == runtime.ErrChannelIDInvalid {
+	} else if errors.Is(err, runtime.ErrChannelIDInvalid) {
 		return nil, status.Error(codes.InvalidArgument, "Channel not found.")
 	} else if err != nil {
 		return nil, status.Error(codes.Internal, "Error listing messages from channel.")
@@ -87,11 +89,11 @@ func (s *ApiServer) ListChannelMessages(ctx context.Context, in *api.ListChannel
 	// After hook.
 	if fn := s.runtime.AfterListChannelMessages(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, messageList, in)
+			return fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, messageList, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return messageList, nil

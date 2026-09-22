@@ -16,11 +16,12 @@ package server
 
 import (
 	"context"
-	"github.com/heroiclabs/nakama-common/runtime"
+	"errors"
 	"strconv"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
+	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -29,17 +30,18 @@ import (
 
 func (s *ApiServer) ListFriends(ctx context.Context, in *api.ListFriendsRequest) (*api.FriendList, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 
 	// Before hook.
 	if fn := s.runtime.BeforeListFriends(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -47,7 +49,7 @@ func (s *ApiServer) ListFriends(ctx context.Context, in *api.ListFriendsRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -68,9 +70,9 @@ func (s *ApiServer) ListFriends(ctx context.Context, in *api.ListFriendsRequest)
 		}
 	}
 
-	friends, err := ListFriends(ctx, s.logger, s.db, s.statusRegistry, userID, limit, state, in.GetCursor())
+	friends, err := ListFriends(ctx, logger, s.db, s.statusRegistry, userID, limit, state, in.GetCursor())
 	if err != nil {
-		if err == runtime.ErrFriendInvalidCursor {
+		if errors.Is(err, runtime.ErrFriendInvalidCursor) {
 			return nil, status.Error(codes.InvalidArgument, "Cursor is invalid.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to list friends.")
@@ -79,29 +81,30 @@ func (s *ApiServer) ListFriends(ctx context.Context, in *api.ListFriendsRequest)
 	// After hook.
 	if fn := s.runtime.AfterListFriends(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, friends)
+			return fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, friends)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return friends, nil
 }
 
-func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (*emptypb.Empty, error) {
+func (s *ApiServer) ListFriendsOfFriends(ctx context.Context, in *api.ListFriendsOfFriendsRequest) (*api.FriendsOfFriendsList, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 
 	// Before hook.
-	if fn := s.runtime.BeforeAddFriends(); fn != nil {
+	if fn := s.runtime.BeforeListFriendsOfFriends(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -109,7 +112,63 @@ func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	limit := 10
+	if in.GetLimit() != nil {
+		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
+		}
+		limit = int(in.GetLimit().Value)
+	}
+
+	friendsOfFriends, err := ListFriendsOfFriends(ctx, logger, s.db, s.statusRegistry, userID, limit, in.GetCursor())
+	if err != nil {
+		if errors.Is(err, runtime.ErrFriendInvalidCursor) {
+			return nil, status.Error(codes.InvalidArgument, "Cursor is invalid.")
+		}
+		return nil, status.Error(codes.Internal, "Error while trying to list friends.")
+	}
+
+	// After hook.
+	if fn := s.runtime.AfterListFriendsOfFriends(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, friendsOfFriends)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return friendsOfFriends, nil
+}
+
+func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (*emptypb.Empty, error) {
+	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
+
+	// Before hook.
+	if fn := s.runtime.BeforeAddFriends(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +200,7 @@ func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (
 
 	userIDs, err := fetchUserID(ctx, s.db, in.GetUsernames())
 	if err != nil {
-		s.logger.Error("Could not fetch user IDs.", zap.Error(err), zap.Strings("usernames", in.GetUsernames()))
+		logger.Error("Could not fetch user IDs.", zap.Error(err), zap.Strings("usernames", in.GetUsernames()))
 		return nil, status.Error(codes.Internal, "Error while trying to add friends.")
 	}
 
@@ -153,18 +212,18 @@ func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (
 	allIDs = append(allIDs, in.GetIds()...)
 	allIDs = append(allIDs, userIDs...)
 
-	if err := AddFriends(ctx, s.logger, s.db, s.router, userID, username, allIDs); err != nil {
+	if err := AddFriends(ctx, logger, s.db, s.tracker, s.router, userID, username, allIDs, in.Metadata); err != nil {
 		return nil, status.Error(codes.Internal, "Error while trying to add friends.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterAddFriends(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			return fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -172,17 +231,18 @@ func (s *ApiServer) AddFriends(ctx context.Context, in *api.AddFriendsRequest) (
 
 func (s *ApiServer) DeleteFriends(ctx context.Context, in *api.DeleteFriendsRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 
 	// Before hook.
 	if fn := s.runtime.BeforeDeleteFriends(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -190,7 +250,7 @@ func (s *ApiServer) DeleteFriends(ctx context.Context, in *api.DeleteFriendsRequ
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -221,12 +281,12 @@ func (s *ApiServer) DeleteFriends(ctx context.Context, in *api.DeleteFriendsRequ
 
 	userIDs, err := fetchUserID(ctx, s.db, in.GetUsernames())
 	if err != nil {
-		s.logger.Error("Could not fetch user IDs.", zap.Error(err), zap.Strings("usernames", in.GetUsernames()))
+		logger.Error("Could not fetch user IDs.", zap.Error(err), zap.Strings("usernames", in.GetUsernames()))
 		return nil, status.Error(codes.Internal, "Error while trying to delete friends.")
 	}
 
 	if len(userIDs)+len(in.GetIds()) == 0 {
-		s.logger.Info("No valid ID or username was provided.")
+		logger.Info("No valid ID or username was provided.")
 		return &emptypb.Empty{}, nil
 	}
 
@@ -234,18 +294,18 @@ func (s *ApiServer) DeleteFriends(ctx context.Context, in *api.DeleteFriendsRequ
 	allIDs = append(allIDs, in.GetIds()...)
 	allIDs = append(allIDs, userIDs...)
 
-	if err := DeleteFriends(ctx, s.logger, s.db, userID, allIDs); err != nil {
+	if err := DeleteFriends(ctx, logger, s.db, s.tracker, s.router, userID, username, allIDs); err != nil {
 		return nil, status.Error(codes.Internal, "Error while trying to delete friends.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterDeleteFriends(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			return fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -253,17 +313,18 @@ func (s *ApiServer) DeleteFriends(ctx context.Context, in *api.DeleteFriendsRequ
 
 func (s *ApiServer) BlockFriends(ctx context.Context, in *api.BlockFriendsRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 
 	// Before hook.
 	if fn := s.runtime.BeforeBlockFriends(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -271,7 +332,7 @@ func (s *ApiServer) BlockFriends(ctx context.Context, in *api.BlockFriendsReques
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -302,7 +363,7 @@ func (s *ApiServer) BlockFriends(ctx context.Context, in *api.BlockFriendsReques
 
 	userIDs, err := fetchUserID(ctx, s.db, in.GetUsernames())
 	if err != nil {
-		s.logger.Error("Could not fetch user IDs.", zap.Error(err), zap.Strings("usernames", in.GetUsernames()))
+		logger.Error("Could not fetch user IDs.", zap.Error(err), zap.Strings("usernames", in.GetUsernames()))
 		return nil, status.Error(codes.Internal, "Error while trying to block friends.")
 	}
 
@@ -314,34 +375,35 @@ func (s *ApiServer) BlockFriends(ctx context.Context, in *api.BlockFriendsReques
 	allIDs = append(allIDs, in.GetIds()...)
 	allIDs = append(allIDs, userIDs...)
 
-	if err := BlockFriends(ctx, s.logger, s.db, userID, allIDs); err != nil {
+	if err := BlockFriends(ctx, logger, s.db, s.tracker, userID, allIDs); err != nil {
 		return nil, status.Error(codes.Internal, "Error while trying to block friends.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterBlockFriends(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			return fn(ctx, logger, traceID, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &emptypb.Empty{}, nil
 }
 
 func (s *ApiServer) ImportFacebookFriends(ctx context.Context, in *api.ImportFacebookFriendsRequest) (*emptypb.Empty, error) {
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 	// Before hook.
 	if fn := s.runtime.BeforeImportFacebookFriends(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", ctx.Value(ctxUserIDKey{}).(uuid.UUID).String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", ctx.Value(ctxUserIDKey{}).(uuid.UUID).String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -349,7 +411,7 @@ func (s *ApiServer) ImportFacebookFriends(ctx context.Context, in *api.ImportFac
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -359,7 +421,7 @@ func (s *ApiServer) ImportFacebookFriends(ctx context.Context, in *api.ImportFac
 		return nil, status.Error(codes.InvalidArgument, "Facebook token is required.")
 	}
 
-	err := importFacebookFriends(ctx, s.logger, s.db, s.router, s.socialClient, ctx.Value(ctxUserIDKey{}).(uuid.UUID), ctx.Value(ctxUsernameKey{}).(string), in.Account.Token, in.Reset_ != nil && in.Reset_.Value)
+	err := importFacebookFriends(ctx, logger, s.db, s.tracker, s.router, s.socialClient, ctx.Value(ctxUserIDKey{}).(uuid.UUID), ctx.Value(ctxUsernameKey{}).(string), in.Account.Token, in.Reset_ != nil && in.Reset_.Value)
 	if err != nil {
 		// Already logged inside the core importFacebookFriends function.
 		return nil, err
@@ -368,11 +430,11 @@ func (s *ApiServer) ImportFacebookFriends(ctx context.Context, in *api.ImportFac
 	// After hook.
 	if fn := s.runtime.AfterImportFacebookFriends(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			return fn(ctx, logger, traceID, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -382,17 +444,18 @@ func (s *ApiServer) ImportSteamFriends(ctx context.Context, in *api.ImportSteamF
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 	username := ctx.Value(ctxUsernameKey{}).(string)
 	vars := ctx.Value(ctxVarsKey{}).(map[string]string)
+	logger, traceID := LoggerWithTraceId(ctx, s.logger)
 
 	// Before hook.
 	if fn := s.runtime.BeforeImportSteamFriends(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, logger, traceID, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
 			if result == nil {
 				// If result is nil, requested resource is disabled.
-				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", ctx.Value(ctxUserIDKey{}).(uuid.UUID).String()))
+				logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", ctx.Value(ctxUserIDKey{}).(uuid.UUID).String()))
 				return status.Error(codes.NotFound, "Requested resource was not found.")
 			}
 			in = result
@@ -400,7 +463,7 @@ func (s *ApiServer) ImportSteamFriends(ctx context.Context, in *api.ImportSteamF
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +484,7 @@ func (s *ApiServer) ImportSteamFriends(ctx context.Context, in *api.ImportSteamF
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, "Could not authenticate Steam profile.")
 	}
-	err = importSteamFriends(ctx, s.logger, s.db, s.router, s.socialClient, userID, username, publisherKey, strconv.Itoa(int(steamProfile.SteamID)), in.Reset_ != nil && in.Reset_.Value)
+	err = importSteamFriends(ctx, logger, s.db, s.tracker, s.router, s.socialClient, userID, username, publisherKey, strconv.Itoa(int(steamProfile.SteamID)), in.Reset_ != nil && in.Reset_.Value)
 	if err != nil {
 		// Already logged inside the core importSteamFriends function.
 		return nil, err
@@ -430,11 +493,11 @@ func (s *ApiServer) ImportSteamFriends(ctx context.Context, in *api.ImportSteamF
 	// After hook.
 	if fn := s.runtime.AfterImportSteamFriends(); fn != nil {
 		afterFn := func(clientIP, clientPort string) error {
-			return fn(ctx, s.logger, userID.String(), username, vars, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			return fn(ctx, logger, traceID, userID.String(), username, vars, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, logger, s.config, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return &emptypb.Empty{}, nil

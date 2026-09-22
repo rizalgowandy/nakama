@@ -15,10 +15,12 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -31,7 +33,7 @@ type Pipeline struct {
 	protojsonMarshaler   *protojson.MarshalOptions
 	protojsonUnmarshaler *protojson.UnmarshalOptions
 	sessionRegistry      SessionRegistry
-	statusRegistry       *StatusRegistry
+	statusRegistry       StatusRegistry
 	matchRegistry        MatchRegistry
 	partyRegistry        PartyRegistry
 	matchmaker           Matchmaker
@@ -39,9 +41,10 @@ type Pipeline struct {
 	router               MessageRouter
 	runtime              *Runtime
 	node                 string
+	metrics              Metrics
 }
 
-func NewPipeline(logger *zap.Logger, config Config, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, sessionRegistry SessionRegistry, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, partyRegistry PartyRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, runtime *Runtime) *Pipeline {
+func NewPipeline(logger *zap.Logger, config Config, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, sessionRegistry SessionRegistry, statusRegistry StatusRegistry, matchRegistry MatchRegistry, partyRegistry PartyRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, runtime *Runtime, metrics Metrics) *Pipeline {
 	return &Pipeline{
 		logger:               logger,
 		config:               config,
@@ -57,23 +60,28 @@ func NewPipeline(logger *zap.Logger, config Config, db *sql.DB, protojsonMarshal
 		router:               router,
 		runtime:              runtime,
 		node:                 config.GetName(),
+		metrics:              metrics,
 	}
 }
 
 func (p *Pipeline) ProcessRequest(logger *zap.Logger, session Session, in *rtapi.Envelope) bool {
+	traceID := uuid.Must(uuid.NewV4()).String()
+	logger = logger.With(zap.String("trace_id", traceID))
+	ctx := context.WithValue(session.Context(), ctxTraceId{}, traceID)
+
 	if logger.Core().Enabled(zap.DebugLevel) { // remove extra heavy reflection processing
 		logger.Debug(fmt.Sprintf("Received %T message", in.Message), zap.Any("message", in.Message))
 	}
 
 	if in.Message == nil {
-		session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+		_ = session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 			Code:    int32(rtapi.Error_MISSING_PAYLOAD),
 			Message: "Missing message.",
 		}}}, true)
 		return false
 	}
 
-	var pipelineFn func(*zap.Logger, Session, *rtapi.Envelope) (bool, *rtapi.Envelope)
+	var pipelineFn func(context.Context, *zap.Logger, Session, *rtapi.Envelope) (bool, *rtapi.Envelope)
 
 	switch in.Message.(type) {
 	case *rtapi.Envelope_ChannelJoin:
@@ -132,11 +140,13 @@ func (p *Pipeline) ProcessRequest(logger *zap.Logger, session Session, in *rtapi
 		pipelineFn = p.partyMatchmakerRemove
 	case *rtapi.Envelope_PartyDataSend:
 		pipelineFn = p.partyDataSend
+	case *rtapi.Envelope_PartyUpdate:
+		pipelineFn = p.partyUpdate
 	default:
 		// If we reached this point the envelope was valid but the contents are missing or unknown.
 		// Usually caused by a version mismatch, and should cause the session making this pipeline request to close.
 		logger.Error("Unrecognizable payload received.", zap.Any("payload", in))
-		session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+		_ = session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 			Code:    int32(rtapi.Error_UNRECOGNIZED_PAYLOAD),
 			Message: "Unrecognized message.",
 		}}}, true)
@@ -147,17 +157,17 @@ func (p *Pipeline) ProcessRequest(logger *zap.Logger, session Session, in *rtapi
 
 	switch in.Message.(type) {
 	case *rtapi.Envelope_Rpc:
-		// No before/after hooks on RPC.
+		// No before/after hooks on RPC. RPC handles its own metrics in pipeline_rpc.go.
 	default:
 		messageName = fmt.Sprintf("%T", in.Message)
 		messageNameID = strings.ToLower(messageName)
 
 		if fn := p.runtime.BeforeRt(messageNameID); fn != nil {
-			hookResult, hookErr := fn(session.Context(), logger, session.UserID().String(), session.Username(), session.Vars(), session.Expiry(), session.ID().String(), session.ClientIP(), session.ClientPort(), session.Lang(), in)
+			hookResult, hookErr := fn(ctx, logger, traceID, session.UserID().String(), session.Username(), session.Vars(), session.Expiry(), session.ID().String(), session.ClientIP(), session.ClientPort(), session.Lang(), in)
 
 			if hookErr != nil {
 				// Errors from before hooks do not close the session.
-				session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+				_ = session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 					Code:    int32(rtapi.Error_RUNTIME_FUNCTION_EXCEPTION),
 					Message: hookErr.Error(),
 				}}}, true)
@@ -165,7 +175,7 @@ func (p *Pipeline) ProcessRequest(logger *zap.Logger, session Session, in *rtapi
 			} else if hookResult == nil {
 				// If result is nil, requested resource is disabled. Sessions calling disabled resources will be closed.
 				logger.Warn("Intercepted a disabled resource.", zap.String("resource", messageName))
-				session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
+				_ = session.Send(&rtapi.Envelope{Cid: in.Cid, Message: &rtapi.Envelope_Error{Error: &rtapi.Error{
 					Code:    int32(rtapi.Error_UNRECOGNIZED_PAYLOAD),
 					Message: "Requested resource was not found.",
 				}}}, true)
@@ -176,12 +186,12 @@ func (p *Pipeline) ProcessRequest(logger *zap.Logger, session Session, in *rtapi
 		}
 	}
 
-	success, out := pipelineFn(logger, session, in)
+	success, out := pipelineFn(ctx, logger, session, in)
 
 	if success && messageName != "" {
 		// Unsuccessful operations do not trigger after hooks.
 		if fn := p.runtime.AfterRt(messageNameID); fn != nil {
-			fn(session.Context(), logger, session.UserID().String(), session.Username(), session.Vars(), session.Expiry(), session.ID().String(), session.ClientIP(), session.ClientPort(), session.Lang(), out, in)
+			_ = fn(ctx, logger, traceID, session.UserID().String(), session.Username(), session.Vars(), session.Expiry(), session.ID().String(), session.ClientIP(), session.ClientPort(), session.Lang(), out, in)
 		}
 	}
 

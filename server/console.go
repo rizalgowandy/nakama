@@ -15,9 +15,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -25,113 +27,50 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
-	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/gofrs/uuid/v5"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/heroiclabs/nakama/v3/console"
+	"github.com/heroiclabs/nakama/v3/console/acl"
+	"github.com/heroiclabs/nakama/v3/internal/satori"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// Lists API methods and the minimum role required to access them
-var restrictedMethods = map[string]console.UserRole{
-	// Account
-	"/nakama.console.Console/BanAccount":         console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnbanAccount":       console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/DeleteAccount":      console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/DeleteAccounts":     console.UserRole_USER_ROLE_DEVELOPER,
-	"/nakama.console.Console/DeleteFriend":       console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/DeleteGroupUser":    console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/DeleteWalletLedger": console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/ExportAccount":      console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/GetAccount":         console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/GetFriends":         console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/GetGroups":          console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/GetWalletLedger":    console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/ListAccounts":       console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/UpdateAccount":      console.UserRole_USER_ROLE_MAINTAINER,
+var _ http.ResponseWriter = (*statusCheckResponseWriter)(nil)
 
-	// API Explorer
-	"/nakama.console.Console/CallRpcEndpoint":  console.UserRole_USER_ROLE_DEVELOPER,
-	"/nakama.console.Console/CallApiEndpoint":  console.UserRole_USER_ROLE_DEVELOPER,
-	"/nakama.console.Console/ListApiEndpoints": console.UserRole_USER_ROLE_DEVELOPER,
-
-	// Config
-	"/nakama.console.Console/GetConfig":     console.UserRole_USER_ROLE_DEVELOPER,
-	"/nakama.console.Console/DeleteAllData": console.UserRole_USER_ROLE_DEVELOPER,
-
-	// Group
-	"/nakama.console.Console/ListGroups":         console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/DeleteGroup":        console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/GetGroup":           console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/ExportGroup":        console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UpdateGroup":        console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/GetMembers":         console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/DemoteGroupMember":  console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/PromoteGroupMember": console.UserRole_USER_ROLE_MAINTAINER,
-
-	// Leaderboard
-	"/nakama.console.Console/ListLeaderboards":        console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/GetLeaderboard":          console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/ListLeaderboardRecords":  console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/DeleteLeaderboard":       console.UserRole_USER_ROLE_DEVELOPER,
-	"/nakama.console.Console/DeleteLeaderboardRecord": console.UserRole_USER_ROLE_MAINTAINER,
-
-	// Match
-	"/nakama.console.Console/ListMatches":   console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/GetMatchState": console.UserRole_USER_ROLE_READONLY,
-
-	// Channel messages
-	"/nakama.console.Console/ListChannelMessages":   console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/DeleteChannelMessages": console.UserRole_USER_ROLE_MAINTAINER,
-
-	// Purchase
-	"/nakama.console.Console/ListPurchases": console.UserRole_USER_ROLE_READONLY,
-
-	// Runtime
-	"/nakama.console.Console/GetRuntime": console.UserRole_USER_ROLE_DEVELOPER,
-
-	// Status
-	"/nakama.console.Console/GetStatus": console.UserRole_USER_ROLE_READONLY,
-
-	// Storage
-	"/nakama.console.Console/DeleteStorage":          console.UserRole_USER_ROLE_DEVELOPER,
-	"/nakama.console.Console/DeleteStorageObject":    console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/GetStorage":             console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/ListStorageCollections": console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/ListStorage":            console.UserRole_USER_ROLE_READONLY,
-	"/nakama.console.Console/WriteStorageObject":     console.UserRole_USER_ROLE_MAINTAINER,
-
-	// Unlink
-	"/nakama.console.Console/UnlinkApple":               console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkCustom":              console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkDevice":              console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkEmail":               console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkFacebook":            console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkFacebookInstantGame": console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkGameCenter":          console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkGoogle":              console.UserRole_USER_ROLE_MAINTAINER,
-	"/nakama.console.Console/UnlinkSteam":               console.UserRole_USER_ROLE_MAINTAINER,
-
-	// User
-	"/nakama.console.Console/AddUser":    console.UserRole_USER_ROLE_ADMIN,
-	"/nakama.console.Console/DeleteUser": console.UserRole_USER_ROLE_ADMIN,
-	"/nakama.console.Console/ListUsers":  console.UserRole_USER_ROLE_ADMIN,
+type statusCheckResponseWriter struct {
+	w          http.ResponseWriter
+	statusCode int
 }
 
+func (s *statusCheckResponseWriter) Header() http.Header {
+	return s.w.Header()
+}
+
+func (s *statusCheckResponseWriter) Write(bytes []byte) (int, error) {
+	return s.w.Write(bytes)
+}
+
+func (s *statusCheckResponseWriter) WriteHeader(statusCode int) {
+	s.statusCode = statusCode
+	s.w.WriteHeader(statusCode)
+}
+
+type ctxConsoleUserIdKey struct{}
 type ctxConsoleUsernameKey struct{}
 type ctxConsoleEmailKey struct{}
-type ctxConsoleRoleKey struct{}
+type ctxConsoleUserAclKey struct{}
 
 type ConsoleServer struct {
 	console.UnimplementedConsoleServer
@@ -146,13 +85,15 @@ type ConsoleServer struct {
 	sessionRegistry      SessionRegistry
 	consoleSessionCache  SessionCache
 	loginAttemptCache    LoginAttemptCache
-	statusRegistry       *StatusRegistry
+	statusRegistry       StatusRegistry
 	matchRegistry        MatchRegistry
 	statusHandler        StatusHandler
+	storageIndex         StorageIndex
 	runtimeInfo          *RuntimeInfo
 	configWarnings       map[string]string
 	serverVersion        string
 	ctxCancelFn          context.CancelFunc
+	runtime              *Runtime
 	grpcServer           *grpc.Server
 	grpcGatewayServer    *http.Server
 	leaderboardCache     LeaderboardCache
@@ -162,9 +103,10 @@ type ConsoleServer struct {
 	rpcMethodCache       *rpcReflectCache
 	cookie               string
 	httpClient           *http.Client
+	satori               *satori.SatoriClient
 }
 
-func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, sessionRegistry SessionRegistry, sessionCache SessionCache, consoleSessionCache SessionCache, loginAttemptCache LoginAttemptCache, statusRegistry *StatusRegistry, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, api *ApiServer, runtime *Runtime, cookie string) *ConsoleServer {
+func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, sessionRegistry SessionRegistry, sessionCache SessionCache, consoleSessionCache SessionCache, loginAttemptCache LoginAttemptCache, statusRegistry StatusRegistry, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, storageIndex StorageIndex, api *ApiServer, runtime *Runtime, cookie string, registerConsoleRouter func(*mux.Router)) *ConsoleServer {
 	var gatewayContextTimeoutMs string
 	if config.GetConsole().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
@@ -176,11 +118,23 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 	serverOpts := []grpc.ServerOption{
 		//grpc.StatsHandler(&ocgrpc.ServerHandler{IsPublicEndpoint: true}),
 		grpc.MaxRecvMsgSize(int(config.GetConsole().MaxMessageSizeBytes)),
-		grpc.UnaryInterceptor(consoleInterceptorFunc(logger, config, consoleSessionCache, loginAttemptCache)),
+		grpc.ChainUnaryInterceptor(
+			func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				ctx = context.WithValue(ctx, ctxTraceId{}, uuid.Must(uuid.NewV4()).String())
+				return handler(ctx, req)
+			},
+			consoleAuthInterceptor(logger, config, consoleSessionCache, loginAttemptCache),
+			consoleAuditLogInterceptor(logger, db),
+		),
 	}
 	grpcServer := grpc.NewServer(serverOpts...)
 
 	ctx, ctxCancelFn := context.WithCancel(context.Background())
+
+	var satoriClient *satori.SatoriClient
+	if config.GetSatori().ServerKey != "" {
+		satoriClient = satori.NewSatoriClient(ctx, logger, config.GetSatori().Url, config.GetSatori().ApiKeyName, config.GetSatori().ApiKey, config.GetSatori().ServerKey, config.GetSatori().SigningKey, config.GetSession().TokenExpirySec, int64(config.GetSatori().HttpTimeoutMs), int64(config.GetSatori().CacheTTLSec), false, config.GetSatori().CacheMode, config.GetSatori().RetryCount)
+	}
 
 	s := &ConsoleServer{
 		logger:               logger,
@@ -200,14 +154,17 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		configWarnings:       configWarnings,
 		serverVersion:        serverVersion,
 		ctxCancelFn:          ctxCancelFn,
+		runtime:              runtime,
 		grpcServer:           grpcServer,
 		runtimeInfo:          runtimeInfo,
 		leaderboardCache:     leaderboardCache,
 		leaderboardRankCache: leaderboardRankCache,
 		leaderboardScheduler: leaderboardScheduler,
+		storageIndex:         storageIndex,
 		api:                  api,
 		cookie:               cookie,
 		httpClient:           &http.Client{Timeout: 5 * time.Second},
+		satori:               satoriClient,
 	}
 
 	if err := s.initRpcMethodCache(); err != nil {
@@ -231,14 +188,10 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		grpcgw.WithUnescapingMode(grpcgw.UnescapingModeAllExceptReserved),
 		grpcgw.WithMarshalerOption(grpcgw.MIMEWildcard, &grpcgw.HTTPBodyMarshaler{
 			Marshaler: &grpcgw.JSONPb{
-				MarshalOptions: protojson.MarshalOptions{
-					UseProtoNames:   true,
-					UseEnumNumbers:  true,
-					EmitUnpopulated: true,
-				},
-				UnmarshalOptions: protojson.UnmarshalOptions{
-					DiscardUnknown: true,
-				},
+				UseProtoNames:   true,
+				UseEnumNumbers:  true,
+				EmitUnpopulated: true,
+				DiscardUnknown:  true,
 			},
 		}),
 	)
@@ -263,26 +216,122 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 
 	// Register public subscription callback endpoints
 	if config.GetIAP().Apple.NotificationsEndpointId != "" {
-		endpoint := fmt.Sprintf("/v2/console/apple/subscriptions/%s", config.GetIAP().Apple.NotificationsEndpointId)
-		grpcGatewayRouter.HandleFunc(endpoint, appleNotificationHandler(logger, db, runtime.PurchaseNotificationApple(), runtime.SubscriptionNotificationApple()))
+		handler := appleNotificationHandler(logger, db, runtime.PurchaseNotificationApple(), runtime.SubscriptionNotificationApple())
+		endpoint := fmt.Sprintf("/v2/console/apple/subscriptions/%s", config.GetIAP().Apple.NotificationsEndpointId) // For backwards compatibility.
+		grpcGatewayRouter.HandleFunc(endpoint, handler)
+		logger.Info("Registered endpoint for Apple subscription notifications callback", zap.String("endpoint", endpoint))
+		endpoint = fmt.Sprintf("/v2/console/apple/notifications/%s", config.GetIAP().Apple.NotificationsEndpointId)
+		grpcGatewayRouter.HandleFunc(endpoint, handler)
 		logger.Info("Registered endpoint for Apple subscription notifications callback", zap.String("endpoint", endpoint))
 	}
 
 	if config.GetIAP().Google.NotificationsEndpointId != "" {
-		endpoint := fmt.Sprintf("/v2/console/google/subscriptions/%s", config.GetIAP().Google.NotificationsEndpointId)
-		grpcGatewayRouter.HandleFunc(endpoint, googleNotificationHandler(logger, db, config.GetIAP().Google))
+		handler := googleNotificationHandler(logger, db, config.GetIAP().Google, runtime.PurchaseNotificationGoogle(), runtime.SubscriptionNotificationGoogle())
+		endpoint := fmt.Sprintf("/v2/console/google/subscriptions/%s", config.GetIAP().Google.NotificationsEndpointId) // For backwards compatibility.
+		grpcGatewayRouter.HandleFunc(endpoint, handler)
+		logger.Info("Registered endpoint for Google subscription notifications callback", zap.String("endpoint", endpoint))
+		endpoint = fmt.Sprintf("/v2/console/google/notifications/%s", config.GetIAP().Google.NotificationsEndpointId)
+		grpcGatewayRouter.HandleFunc(endpoint, handler)
 		logger.Info("Registered endpoint for Google subscription notifications callback", zap.String("endpoint", endpoint))
 	}
-
-	// TODO: Register Huawei callbacks
 
 	// pprof routes
 	grpcGatewayRouter.Handle("/debug/pprof/", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Index)))
 	grpcGatewayRouter.Handle("/debug/pprof/cmdline", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Cmdline)))
 	grpcGatewayRouter.Handle("/debug/pprof/profile", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Profile)))
+	grpcGatewayRouter.Handle("/debug/pprof/profile_js", adminBasicAuth(config.GetConsole())(http.HandlerFunc(ProfileGoja)))
 	grpcGatewayRouter.Handle("/debug/pprof/symbol", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Symbol)))
 	grpcGatewayRouter.Handle("/debug/pprof/trace", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Trace)))
+	if registerConsoleRouter != nil {
+		subrouter := grpcGatewayRouter.NewRoute().Subrouter()
+		subrouter.Use(adminBasicAuth(config.GetConsole()))
+		registerConsoleRouter(subrouter)
+	}
 	grpcGatewayRouter.Handle("/debug/pprof/{profile}", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Index)))
+
+	customHttpAuthFunc := func(path string, methods []string, handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+		var method string
+		if len(methods) == 1 {
+			method = methods[0]
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			r, success, code, message := checkAuthCustom(r, logger, config, r.Header.Get("Authorization"), method, path, sessionCache, loginAttemptCache)
+			if !success {
+				w.Header().Set("content-type", "application/json")
+				w.WriteHeader(code)
+				_, err := w.Write([]byte(message))
+				if err != nil {
+					s.logger.Debug("Error writing response to client", zap.Error(err))
+				}
+				return
+			}
+
+			handler(w, r)
+		}
+	}
+
+	customHttpAuditLogFunc := func(path string, methods []string, handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+		var method string
+		if len(methods) == 1 {
+			method = methods[0]
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			// Read the body so we can later write it to the audit log.
+			originalBody, err := io.ReadAll(r.Body)
+			if err != nil {
+				s.logger.Error("Error reading request body", zap.Error(err))
+
+				w.Header().Set("content-type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				if _, err = w.Write(internalServerErrorBytes); err != nil {
+					s.logger.Debug("Error writing response to client", zap.Error(err))
+				}
+				return
+			}
+			_ = r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(originalBody))
+
+			sw := &statusCheckResponseWriter{w: w}
+
+			handler(sw, r)
+
+			// If operation was successful, note it in the audit log.
+			if sw.statusCode >= 200 && sw.statusCode < 300 {
+				consoleHttpAuditLogInterceptor(r.Context(), logger, db, method, path, originalBody)
+			}
+		}
+	}
+
+	customHttpMuxParamsFunc := func(handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			for k, v := range mux.Vars(r) {
+				r.SetPathValue(k, v)
+			}
+			handler(w, r)
+		}
+	}
+
+	// Custom routes.
+	for _, handler := range runtime.consoleHttpHandlers {
+		if handler == nil {
+			continue
+		}
+		if !strings.HasPrefix(handler.PathPattern, "/") {
+			logger.Fatal("Failed to register custom console HTTP handler, path pattern must start with '/'", zap.String("path_pattern", handler.PathPattern))
+		}
+		handlerFunc := handler.Handler
+		if strings.HasPrefix(handler.PathPattern, "/v2/console/hiro/") {
+			// Handlers in reverse order of priority.
+			handlerFunc = customHttpMuxParamsFunc(handlerFunc)
+			handlerFunc = customHttpAuditLogFunc(handler.PathPattern, handler.Methods, handlerFunc)
+			handlerFunc = customHttpAuthFunc(handler.PathPattern, handler.Methods, handlerFunc)
+		}
+		route := grpcGatewayRouter.HandleFunc(handler.PathPattern, handlerFunc)
+		if len(handler.Methods) > 0 {
+			route.Methods(handler.Methods...)
+		}
+		logger.Info("Registered custom console HTTP handler", zap.String("path_pattern", handler.PathPattern))
+	}
 
 	// Enable max size check on requests coming arriving the gateway.
 	// Enable compression on responses sent by the gateway.
@@ -299,14 +348,16 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		r.Header.Set("Grpc-Timeout", gatewayContextTimeoutMs)
 
 		// Allow GRPC Gateway to handle the request.
-		handlerWithMaxBody.ServeHTTP(w, r)
+		handlerWithMaxBody.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxTraceId{}, uuid.Must(uuid.NewV4()).String())))
 	})
-	registerDashboardHandlers(logger, grpcGatewayRouter)
+	if err := registerDashboardHandlers(logger, grpcGatewayRouter); err != nil {
+		startupLogger.Fatal("Console dashboard registration failed", zap.Error(err))
+	}
 
 	// Enable CORS on all requests.
 	CORSHeaders := handlers.AllowedHeaders([]string{"Authorization", "Content-Type", "User-Agent"})
 	CORSOrigins := handlers.AllowedOrigins([]string{"*"})
-	CORSMethods := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"})
+	CORSMethods := handlers.AllowedMethods([]string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch})
 	handlerWithCORS := handlers.CORS(CORSHeaders, CORSOrigins, CORSMethods)(grpcGatewayRouter)
 
 	// Set up and start GRPC Gateway server.
@@ -320,7 +371,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 
 	startupLogger.Info("Starting Console server gateway for HTTP requests", zap.Int("port", config.GetConsole().Port))
 	go func() {
-		if err := s.grpcGatewayServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.grpcGatewayServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			startupLogger.Fatal("Console server gateway listener failed", zap.Error(err))
 		}
 	}()
@@ -362,7 +413,7 @@ SELECT collection FROM t WHERE collection IS NOT NULL`
 			sort.Strings(collections)
 			collectionSetCache.Store(collections)
 
-			elapsed := time.Now().Sub(startAt)
+			elapsed := time.Since(startAt)
 			elapsed *= 20
 			if elapsed < time.Minute {
 				elapsed = time.Minute
@@ -390,44 +441,73 @@ SELECT collection FROM t WHERE collection IS NOT NULL`
 	return s
 }
 
-func registerDashboardHandlers(logger *zap.Logger, router *mux.Router) {
+func registerDashboardHandlers(logger *zap.Logger, router *mux.Router) error {
+	indexFile, err := console.UIFS.Open("index.html")
+	if err != nil {
+		logger.Error("Failed to open index file.", zap.Error(err))
+		return err
+	}
+	// inject variables into the index.html file
+	indexBytes, err := io.ReadAll(indexFile)
+	if err != nil {
+		logger.Error("Failed to read index file.", zap.Error(err))
+		return err
+	}
+	_ = indexFile.Close()
+	indexHTMLStr := string(indexBytes)
+	indexHTMLStr = strings.ReplaceAll(indexHTMLStr, "{{nt}}", strconv.FormatBool(console.UIFS.Nt))
+	indexBytes = []byte(indexHTMLStr)
+
 	indexFn := func(w http.ResponseWriter, r *http.Request) {
-		indexFile, err := console.UIFS.Open("index.html")
-		if err != nil {
-			logger.Error("Failed to open index file.", zap.Error(err))
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		indexBytes, err := io.ReadAll(indexFile)
-		if err != nil {
-			logger.Error("Failed to read index file.", zap.Error(err))
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
 		w.Header().Add("Cache-Control", "no-cache")
 		w.Header().Set("X-Frame-Options", "deny")
-		w.Write(indexBytes)
-		return
+		_, _ = w.Write(indexBytes)
 	}
 
 	router.Path("/").HandlerFunc(indexFn)
 	router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// get the absolute path to prevent directory traversal
 		path := r.URL.Path
-		logger = logger.With(zap.String("path", path))
+		isAsset := false
+
+		if strings.HasPrefix(path, "/static/") {
+			isAsset = true
+
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+
+			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				if strings.HasSuffix(path, ".css") || strings.HasSuffix(path, ".js") {
+					w.Header().Set("Content-Encoding", "gzip")
+
+					if strings.HasSuffix(path, ".css") {
+						w.Header().Set("Content-Type", "text/css")
+					} else {
+						w.Header().Set("Content-Type", "application/javascript")
+					}
+
+					path = path + ".gz"
+				}
+			}
+		}
 
 		// check whether a file exists at the given path
 		if _, err := console.UIFS.Open(path); err == nil {
 			// otherwise, use http.FileServer to serve the static dir
 			r.URL.Path = path // override the path with the prefixed path
 			console.UI.ServeHTTP(w, r)
+
 			return
 		} else {
+			if isAsset {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+
 			indexFn(w, r)
 		}
 	})
+
+	return nil
 }
 
 func (s *ConsoleServer) Stop() {
@@ -440,13 +520,19 @@ func (s *ConsoleServer) Stop() {
 	s.grpcServer.GracefulStop()
 }
 
-func consoleInterceptorFunc(logger *zap.Logger, config Config, sessionCache SessionCache, loginAttmeptCache LoginAttemptCache) func(context.Context, interface{}, *grpc.UnaryServerInfo, grpc.UnaryHandler) (interface{}, error) {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func consoleAuthInterceptor(logger *zap.Logger, config Config, sessionCache SessionCache, loginAttmeptCache LoginAttemptCache) func(context.Context, any, *grpc.UnaryServerInfo, grpc.UnaryHandler) (any, error) {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if info.FullMethod == "/nakama.console.Console/Authenticate" {
 			// Skip authentication check for Login endpoint.
 			return handler(ctx, req)
 		}
+		if info.FullMethod == "/nakama.console.Console/AuthenticateMFASetup" {
+			return handler(ctx, req)
+		}
 		if info.FullMethod == "/nakama.console.Console/AuthenticateLogout" {
+			return handler(ctx, req)
+		}
+		if info.FullMethod == "/nakama.console.Console/AuthenticatePasswordChange" {
 			return handler(ctx, req)
 		}
 
@@ -466,21 +552,16 @@ func consoleInterceptorFunc(logger *zap.Logger, config Config, sessionCache Sess
 			return nil, status.Error(codes.Unauthenticated, "Console authentication required.")
 		}
 
-		if ctx, ok = checkAuth(ctx, logger, config, auth[0], sessionCache, loginAttmeptCache); !ok {
-			return nil, status.Error(codes.Unauthenticated, "Console authentication invalid.")
-		}
-		role := ctx.Value(ctxConsoleRoleKey{}).(console.UserRole)
-
-		// if restriction was defined, and user role is less than or equal to (in number, lower = higher privilege) the restriction (excluding 0 - UNKNOWN), allow access; otherwise block access for all but admins
-		if restrictedRole, restrictionFound := restrictedMethods[info.FullMethod]; (restrictionFound && role <= restrictedRole && role != console.UserRole_USER_ROLE_UNKNOWN) || role == console.UserRole_USER_ROLE_ADMIN {
-			return handler(ctx, req)
+		ctx, err := checkAuth(ctx, logger, config, auth[0], info.FullMethod, sessionCache, loginAttmeptCache)
+		if err != nil {
+			return nil, err
 		}
 
-		return nil, status.Error(codes.PermissionDenied, "You don't have the necessary permissions to complete the operation.")
+		return handler(ctx, req)
 	}
 }
 
-func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (context.Context, bool) {
+func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth, path string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (context.Context, error) {
 	const basicPrefix = "Basic "
 	const bearerPrefix = "Bearer "
 
@@ -488,36 +569,41 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth stri
 		// Basic authentication.
 		username, password, ok := parseBasicAuth(auth)
 		if !ok {
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Console authentication invalid.")
 		}
-		ip, _ := extractClientAddressFromContext(logger, ctx)
+		ip, _ := extractClientAddressFromContext(logger, config, ctx)
 		if !loginAttemptCache.Allow(username, ip) {
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Console authentication invalid.")
 		}
 		if username == config.GetConsole().Username {
 			if password != config.GetConsole().Password {
 				// Admin password does not match.
-				if lockout, until := loginAttemptCache.Add(config.GetConsole().Username, ip); lockout != LockoutTypeNone {
-					switch lockout {
-					case LockoutTypeAccount:
-						logger.Info(fmt.Sprintf("Console admin account locked until %v.", until))
-					case LockoutTypeIp:
-						logger.Info(fmt.Sprintf("Console admin IP locked until %v.", until))
-					}
+				lockout, until := loginAttemptCache.Add(config.GetConsole().Username, ip)
+				switch lockout {
+				case LockoutTypeAccount:
+					logger.Info(fmt.Sprintf("Console admin account locked until %v.", until))
+				case LockoutTypeIp:
+					logger.Info(fmt.Sprintf("Console admin IP locked until %v.", until))
+				case LockoutTypeNone:
+					fallthrough
+				default:
+					// No lockout.
 				}
-				return ctx, false
+				return ctx, status.Error(codes.Unauthenticated, "Console authentication invalid.")
 			}
 		} else {
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Console authentication invalid.")
 		}
 
-		ctx = context.WithValue(context.WithValue(context.WithValue(ctx, ctxConsoleRoleKey{}, console.UserRole_USER_ROLE_ADMIN), ctxConsoleUsernameKey{}, username), ctxConsoleEmailKey{}, "")
+		ctx = context.WithValue(ctx, ctxConsoleUserAclKey{}, acl.Admin())
+		ctx = context.WithValue(ctx, ctxConsoleUsernameKey{}, username)
+		ctx = context.WithValue(ctx, ctxConsoleEmailKey{}, "")
 		// Basic authentication successful.
-		return ctx, true
+		return ctx, nil
 	} else if strings.HasPrefix(auth, bearerPrefix) {
 		// Bearer token authentication.
 		tokenStr := auth[len(bearerPrefix):]
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
 			if s, ok := token.Method.(*jwt.SigningMethodHMAC); !ok || s.Hash != crypto.SHA256 {
 				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 			}
@@ -525,36 +611,132 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth stri
 		})
 		if err != nil {
 			// Token verification failed.
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
-		id, uname, email, role, exp, ok := parseConsoleToken([]byte(config.GetConsole().SigningKey), tokenStr)
+		id, uname, email, userAcl, exp, ok, err := parseConsoleToken([]byte(config.GetConsole().SigningKey), tokenStr)
+		if err != nil {
+			logger.Error("Failed to parse token console jwt token.", zap.Error(err))
+			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
+		}
 		if !ok || !token.Valid {
 			// The token or its claims are invalid.
-			return ctx, false
-		}
-		if !ok {
-			// Expiry time claim is invalid.
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
 		if exp <= time.Now().UTC().Unix() {
 			// Token expired.
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
 		userId, err := uuid.FromString(id)
 		if err != nil {
 			// Malformed id
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
 		if !sessionCache.IsValidSession(userId, exp, tokenStr) {
-			return ctx, false
+			return ctx, status.Error(codes.Unauthenticated, "Token invalid.")
 		}
 
-		ctx = context.WithValue(context.WithValue(context.WithValue(ctx, ctxConsoleRoleKey{}, role), ctxConsoleUsernameKey{}, uname), ctxConsoleEmailKey{}, email)
+		ctx = context.WithValue(ctx, ctxConsoleUserIdKey{}, userId)
+		ctx = context.WithValue(ctx, ctxConsoleUsernameKey{}, uname)
+		ctx = context.WithValue(ctx, ctxConsoleEmailKey{}, email)
+		ctx = context.WithValue(ctx, ctxConsoleUserAclKey{}, userAcl)
 
-		return ctx, true
+		if !(acl.CheckACL(path, userAcl)) {
+			return ctx, status.Error(codes.PermissionDenied, "Unauthorized: you do not have permissions to access this resource.")
+		}
+
+		return ctx, nil
 	}
 
-	return ctx, false
+	return ctx, status.Error(codes.Unauthenticated, "Console authentication required.")
+}
+
+func checkAuthCustom(r *http.Request, logger *zap.Logger, config Config, auth, method, path string, sessionCache SessionCache, loginAttemptCache LoginAttemptCache) (*http.Request, bool, int, string) {
+	const basicPrefix = "Basic "
+	const bearerPrefix = "Bearer "
+
+	if strings.HasPrefix(auth, basicPrefix) {
+		// Basic authentication.
+		username, password, ok := parseBasicAuth(auth)
+		if !ok {
+			return r, false, http.StatusUnauthorized, `{"error":"Console authentication invalid.","message":"Console authentication invalid.","code":16}`
+		}
+		ip, _ := extractClientAddressFromRequest(logger, config, r)
+		if !loginAttemptCache.Allow(username, ip) {
+			return r, false, http.StatusUnauthorized, `{"error":"Console authentication invalid.","message":"Console authentication invalid.","code":16}`
+		}
+		if username == config.GetConsole().Username {
+			if password != config.GetConsole().Password {
+				// Admin password does not match.
+				lockout, until := loginAttemptCache.Add(config.GetConsole().Username, ip)
+				switch lockout {
+				case LockoutTypeAccount:
+					logger.Info(fmt.Sprintf("Console admin account locked until %v.", until))
+				case LockoutTypeIp:
+					logger.Info(fmt.Sprintf("Console admin IP locked until %v.", until))
+				case LockoutTypeNone:
+					fallthrough
+				default:
+					// No lockout.
+				}
+				return r, false, http.StatusUnauthorized, `{"error":"Console authentication invalid.","message":"Console authentication invalid.","code":16}`
+			}
+		} else {
+			return r, false, http.StatusUnauthorized, `{"error":"Console authentication invalid.","message":"Console authentication invalid.","code":16}`
+		}
+
+		ctx := context.WithValue(r.Context(), ctxConsoleUserAclKey{}, acl.Admin())
+		ctx = context.WithValue(ctx, ctxConsoleUsernameKey{}, username)
+		ctx = context.WithValue(ctx, ctxConsoleEmailKey{}, "")
+		// Basic authentication successful.
+		return r.WithContext(ctx), true, 0, ""
+	} else if strings.HasPrefix(auth, bearerPrefix) {
+		// Bearer token authentication.
+		tokenStr := auth[len(bearerPrefix):]
+		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
+			if s, ok := token.Method.(*jwt.SigningMethodHMAC); !ok || s.Hash != crypto.SHA256 {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return []byte(config.GetConsole().SigningKey), nil
+		})
+		if err != nil {
+			// Token verification failed.
+			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
+		}
+		id, uname, email, userAcl, exp, ok, err := parseConsoleToken([]byte(config.GetConsole().SigningKey), tokenStr)
+		if err != nil {
+			logger.Error("Failed to parse token console jwt token.", zap.Error(err))
+			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
+		}
+		if !ok || !token.Valid {
+			// The token or its claims are invalid.
+			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
+		}
+		if exp <= time.Now().UTC().Unix() {
+			// Token expired.
+			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
+		}
+		userId, err := uuid.FromString(id)
+		if err != nil {
+			// Malformed id
+			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
+		}
+		if !sessionCache.IsValidSession(userId, exp, tokenStr) {
+			return r, false, http.StatusUnauthorized, `{"error":"Token invalid.","message":"Token invalid.","code":16}`
+		}
+
+		ctx := context.WithValue(r.Context(), ctxConsoleUserIdKey{}, userId)
+		ctx = context.WithValue(ctx, ctxConsoleUsernameKey{}, uname)
+		ctx = context.WithValue(ctx, ctxConsoleEmailKey{}, email)
+		ctx = context.WithValue(ctx, ctxConsoleUserAclKey{}, userAcl)
+
+		if !(acl.CheckACLHttp(method, path, userAcl)) {
+			return r, false, http.StatusForbidden, `{"error":"Unauthorized: you do not have permissions to access this resource.","message":"Unauthorized: you do not have permissions to access this resource.","code":7}`
+		}
+
+		return r.WithContext(ctx), true, 0, ""
+	}
+
+	return r, false, http.StatusUnauthorized, `{"error":"Console authentication required.","message":"Console authentication required.","code":16}`
 }
 
 func adminBasicAuth(config *ConsoleConfig) func(h http.Handler) http.Handler {

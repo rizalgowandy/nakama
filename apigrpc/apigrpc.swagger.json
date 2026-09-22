@@ -558,6 +558,59 @@
         ]
       }
     },
+    "/v2/account/authenticate": {
+      "post": {
+        "summary": "Authenticate a user with a runtime-registered provider against the server.",
+        "operationId": "Nakama_Authenticate",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/apiSession"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "account",
+            "description": "The provider account details.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/apiAccountProvider"
+            }
+          },
+          {
+            "name": "create",
+            "description": "Register the account if the user does not already exist.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "username",
+            "description": "Set the username on the account at register. Must be unique.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ],
+        "security": [
+          {
+            "BasicAuth": []
+          }
+        ]
+      }
+    },
     "/v2/account/authenticate/steam": {
       "post": {
         "summary": "Authenticate a user with Steam against the server.",
@@ -857,7 +910,7 @@
         "parameters": [
           {
             "name": "body",
-            "description": "Send Apple's Game Center account credentials to the server. Used with authenticate/link/unlink.",
+            "description": "Send Apple's Game Center account credentials to the server. Used with authenticate/link/unlink.\n\nhttps://developer.apple.com/documentation/gamekit/gklocalplayer/1515407-generateidentityverificationsign",
             "in": "body",
             "required": true,
             "schema": {
@@ -897,6 +950,41 @@
             "required": true,
             "schema": {
               "$ref": "#/definitions/apiAccountGoogle"
+            }
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
+    "/v2/account/link": {
+      "post": {
+        "summary": "Add an authentication provider identity to the current user's account.",
+        "operationId": "Nakama_Link",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "Send credentials for a runtime-registered authentication provider. Used with authenticate/link/unlink.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/apiAccountProvider"
             }
           }
         ],
@@ -1211,7 +1299,7 @@
         "parameters": [
           {
             "name": "body",
-            "description": "Send Apple's Game Center account credentials to the server. Used with authenticate/link/unlink.",
+            "description": "Send Apple's Game Center account credentials to the server. Used with authenticate/link/unlink.\n\nhttps://developer.apple.com/documentation/gamekit/gklocalplayer/1515407-generateidentityverificationsign",
             "in": "body",
             "required": true,
             "schema": {
@@ -1251,6 +1339,41 @@
             "required": true,
             "schema": {
               "$ref": "#/definitions/apiAccountGoogle"
+            }
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
+    "/v2/account/unlink": {
+      "post": {
+        "summary": "Remove an authentication provider identity from the current user's account.",
+        "operationId": "Nakama_Unlink",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "Send credentials for a runtime-registered authentication provider. Used with authenticate/link/unlink.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/apiAccountProvider"
             }
           }
         ],
@@ -1374,7 +1497,7 @@
             "in": "body",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/apiEvent"
+              "$ref": "#/definitions/nakamaApiEvent"
             }
           }
         ],
@@ -1404,7 +1527,7 @@
         "parameters": [
           {
             "name": "limit",
-            "description": "Max number of records to return. Between 1 and 100.",
+            "description": "Max number of records to return. Between 1 and 1000.",
             "in": "query",
             "required": false,
             "type": "integer",
@@ -1516,6 +1639,13 @@
               "type": "string"
             },
             "collectionFormat": "multi"
+          },
+          {
+            "name": "metadata",
+            "description": "Optional metadata to add to friends.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -1606,6 +1736,46 @@
             "in": "query",
             "required": false,
             "type": "boolean"
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
+    "/v2/friend/friends": {
+      "get": {
+        "summary": "List friends of friends for the current user.",
+        "operationId": "Nakama_ListFriendsOfFriends",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/apiFriendsOfFriendsList"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "description": "Max number of records to return. Between 1 and 100.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "cursor",
+            "description": "An optional next page cursor.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -1819,7 +1989,7 @@
             "in": "body",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/apiUpdateGroupRequest"
+              "$ref": "#/definitions/NakamaUpdateGroupBody"
             }
           }
         ],
@@ -2202,6 +2372,39 @@
         ]
       }
     },
+    "/v2/iap/purchase/facebookinstant": {
+      "post": {
+        "summary": "Validate FB Instant IAP Receipt",
+        "operationId": "Nakama_ValidatePurchaseFacebookInstant",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/apiValidatePurchaseResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/apiValidatePurchaseFacebookInstantRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
     "/v2/iap/purchase/google": {
       "post": {
         "summary": "Validate Google IAP Receipt",
@@ -2260,6 +2463,40 @@
             "required": true,
             "schema": {
               "$ref": "#/definitions/apiValidatePurchaseHuaweiRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
+    "/v2/iap/purchase/samsung": {
+      "post": {
+        "summary": "Validate Samsung Galaxy Store IAP Receipt",
+        "operationId": "Nakama_ValidatePurchaseSamsung",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/apiValidatePurchaseResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "Samsung IAP Purchase validation request.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/apiValidatePurchaseSamsungRequest"
             }
           }
         ],
@@ -2538,7 +2775,7 @@
     },
     "/v2/leaderboard/{leaderboardId}/owner/{ownerId}": {
       "get": {
-        "summary": "List leaderboard records that belong to a user.",
+        "summary": "List leaderboard records around the target ownerId.",
         "operationId": "Nakama_ListLeaderboardRecordsAroundOwner",
         "responses": {
           "200": {
@@ -2600,7 +2837,7 @@
     },
     "/v2/match": {
       "get": {
-        "summary": "Fetch list of running matches.",
+        "summary": "List running matches and optionally filter by matching criteria.",
         "operationId": "Nakama_ListMatches",
         "responses": {
           "200": {
@@ -2668,6 +2905,29 @@
         ]
       }
     },
+    "/v2/matchmaker/stats": {
+      "get": {
+        "summary": "Get matchmaker stats.",
+        "operationId": "Nakama_GetMatchmakerStats",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/apiMatchmakerStats"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
     "/v2/notification": {
       "get": {
         "summary": "Fetch list of notifications.",
@@ -2697,7 +2957,7 @@
           },
           {
             "name": "cacheableCursor",
-            "description": "A cursor to page through notifications. May be cached by clients to get from point in time forwards.",
+            "description": "A cursor to page through notifications. May be cached by clients to get from point in time forwards.\n\nvalue from NotificationList.cacheable_cursor.",
             "in": "query",
             "required": false,
             "type": "string"
@@ -2736,6 +2996,60 @@
               "type": "string"
             },
             "collectionFormat": "multi"
+          }
+        ],
+        "tags": [
+          "Nakama"
+        ]
+      }
+    },
+    "/v2/party": {
+      "get": {
+        "summary": "List parties and optionally filter by matching criteria.",
+        "operationId": "Nakama_ListParties",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/apiPartyList"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "description": "Limit the number of returned parties.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "open",
+            "description": "Optionally filter by open/closed parties.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "query",
+            "description": "Arbitrary label query.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "cursor",
+            "description": "Cursor for the next page of results, if any.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -3026,7 +3340,7 @@
           },
           {
             "name": "cursor",
-            "description": "The cursor to page through results from.",
+            "description": "The cursor to page through results from.\n\nvalue from StorageObjectList.cursor.",
             "in": "query",
             "required": false,
             "type": "string"
@@ -3080,7 +3394,7 @@
           },
           {
             "name": "cursor",
-            "description": "The cursor to page through results from.",
+            "description": "The cursor to page through results from.\n\nvalue from StorageObjectList.cursor.",
             "in": "query",
             "required": false,
             "type": "string"
@@ -3548,6 +3862,20 @@
     }
   },
   "definitions": {
+    "FriendsOfFriendsListFriendOfFriend": {
+      "type": "object",
+      "properties": {
+        "referrer": {
+          "type": "string",
+          "description": "The user who referred its friend."
+        },
+        "user": {
+          "$ref": "#/definitions/apiUser",
+          "description": "User."
+        }
+      },
+      "description": "A friend of a friend."
+    },
     "GroupUserListGroupUser": {
       "type": "object",
       "properties": {
@@ -3562,6 +3890,32 @@
         }
       },
       "description": "A single user-role pair."
+    },
+    "NakamaUpdateGroupBody": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name."
+        },
+        "description": {
+          "type": "string",
+          "description": "Description string."
+        },
+        "langTag": {
+          "type": "string",
+          "description": "Lang tag."
+        },
+        "avatarUrl": {
+          "type": "string",
+          "description": "Avatar URL."
+        },
+        "open": {
+          "type": "boolean",
+          "description": "Open is true if anyone should be allowed to join, or false if joins must be approved by a group admin."
+        }
+      },
+      "description": "Update fields in a given group."
     },
     "UserGroupListUserGroup": {
       "type": "object",
@@ -3644,6 +3998,7 @@
         "devices": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiAccountDevice"
           },
           "description": "The devices which belong to the user's account."
@@ -3661,6 +4016,14 @@
           "type": "string",
           "format": "date-time",
           "description": "The UNIX time (for gRPC clients) or ISO string (for REST clients) when the user's account was disabled/banned."
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/apiAccountProviderIdentity"
+          },
+          "description": "The authentication provider identities linked to the user's account."
         }
       },
       "description": "A user with additional account details. Always the current user."
@@ -3725,7 +4088,7 @@
         },
         "password": {
           "type": "string",
-          "description": "A password for the user account."
+          "description": "A password for the user account.\n\nIgnored with unlink operations."
         },
         "vars": {
           "type": "object",
@@ -3807,7 +4170,7 @@
           "description": "Extra information that will be bundled in the session token."
         }
       },
-      "description": "Send Apple's Game Center account credentials to the server. Used with authenticate/link/unlink."
+      "description": "Send Apple's Game Center account credentials to the server. Used with authenticate/link/unlink.\n\nhttps://developer.apple.com/documentation/gamekit/gklocalplayer/1515407-generateidentityverificationsign"
     },
     "apiAccountGoogle": {
       "type": "object",
@@ -3825,6 +4188,44 @@
         }
       },
       "description": "Send a Google token to the server. Used with authenticate/link/unlink."
+    },
+    "apiAccountProvider": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "The name the provider was registered under during runtime initialization."
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Arbitrary JSON passed through to the registered provider function."
+        },
+        "vars": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra information that will be bundled in the session token."
+        }
+      },
+      "description": "Send credentials for a runtime-registered authentication provider. Used with authenticate/link/unlink."
+    },
+    "apiAccountProviderIdentity": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "The name the provider was registered under during runtime initialization."
+        },
+        "providerUserId": {
+          "type": "string",
+          "description": "The user's ID with that provider."
+        }
+      },
+      "description": "A provider identity linked to a user's account."
     },
     "apiAccountSteam": {
       "type": "object",
@@ -3910,6 +4311,7 @@
         "messages": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiChannelMessage"
           },
           "description": "A list of messages."
@@ -3984,38 +4386,13 @@
         "objectIds": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiDeleteStorageObjectId"
           },
           "description": "Batch of storage objects."
         }
       },
       "description": "Batch delete storage objects."
-    },
-    "apiEvent": {
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "An event name, type, category, or identifier."
-        },
-        "properties": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "Arbitrary event property values."
-        },
-        "timestamp": {
-          "type": "string",
-          "format": "date-time",
-          "description": "The time when the event was triggered."
-        },
-        "external": {
-          "type": "boolean",
-          "description": "True if the event came directly from a client call, false otherwise."
-        }
-      },
-      "description": "Represents an event to be passed through the server to registered event handlers."
     },
     "apiFriend": {
       "type": "object",
@@ -4027,12 +4404,16 @@
         "state": {
           "type": "integer",
           "format": "int32",
-          "description": "The friend status."
+          "description": "The friend status.\n\none of \"Friend.State\"."
         },
         "updateTime": {
           "type": "string",
           "format": "date-time",
           "description": "Time of the latest relationship update."
+        },
+        "metadata": {
+          "type": "string",
+          "description": "Metadata."
         }
       },
       "description": "A friend of a user."
@@ -4043,6 +4424,7 @@
         "friends": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiFriend"
           },
           "description": "The Friend objects."
@@ -4053,6 +4435,24 @@
         }
       },
       "description": "A collection of zero or more friends of the user."
+    },
+    "apiFriendsOfFriendsList": {
+      "type": "object",
+      "properties": {
+        "friendsOfFriends": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/FriendsOfFriendsListFriendOfFriend"
+          },
+          "description": "User friends of friends."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Cursor for the next page of results, if any."
+        }
+      },
+      "title": "A List of friends of friends"
     },
     "apiGroup": {
       "type": "object",
@@ -4118,6 +4518,7 @@
         "groups": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiGroup"
           },
           "description": "One or more groups."
@@ -4135,6 +4536,7 @@
         "groupUsers": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/GroupUserListGroupUser"
           },
           "description": "User-role pairs for a group."
@@ -4214,6 +4616,7 @@
         "records": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiLeaderboardRecord"
           },
           "description": "A list of leaderboard records."
@@ -4221,6 +4624,7 @@
         "ownerRecords": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiLeaderboardRecord"
           },
           "description": "A batched set of leaderboard records belonging to specified owners."
@@ -4232,6 +4636,11 @@
         "prevCursor": {
           "type": "string",
           "description": "The cursor to send when retrieving the previous page, if any."
+        },
+        "rankCount": {
+          "type": "string",
+          "format": "int64",
+          "description": "The total number of ranks available."
         }
       },
       "description": "A set of leaderboard records, may be part of a leaderboard records page or a batch of individual records."
@@ -4303,12 +4712,48 @@
         "matches": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiMatch"
           },
           "description": "A number of matches corresponding to a list operation."
         }
       },
       "description": "A list of realtime matches."
+    },
+    "apiMatchmakerCompletionStats": {
+      "type": "object",
+      "properties": {
+        "createTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completeTime": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "title": "Matchmaker ticket completion stats"
+    },
+    "apiMatchmakerStats": {
+      "type": "object",
+      "properties": {
+        "ticketCount": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "oldestTicketCreateTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/apiMatchmakerCompletionStats"
+          }
+        }
+      },
+      "title": "Matchmaker stats"
     },
     "apiNotification": {
       "type": "object",
@@ -4352,6 +4797,7 @@
         "notifications": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiNotification"
           },
           "description": "Collection of notifications."
@@ -4374,6 +4820,51 @@
       ],
       "default": "NO_OVERRIDE",
       "description": "Operator that can be used to override the one set in the leaderboard.\n\n - NO_OVERRIDE: Do not override the leaderboard operator.\n - BEST: Override the leaderboard operator with BEST.\n - SET: Override the leaderboard operator with SET.\n - INCREMENT: Override the leaderboard operator with INCREMENT.\n - DECREMENT: Override the leaderboard operator with DECREMENT."
+    },
+    "apiParty": {
+      "type": "object",
+      "properties": {
+        "partyId": {
+          "type": "string",
+          "description": "Unique party identifier."
+        },
+        "open": {
+          "type": "boolean",
+          "description": "Open flag."
+        },
+        "hidden": {
+          "type": "boolean",
+          "description": "Hidden flag."
+        },
+        "maxSize": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Maximum number of party members."
+        },
+        "label": {
+          "type": "string",
+          "description": "The party label, if any."
+        }
+      },
+      "description": "Incoming information about a party."
+    },
+    "apiPartyList": {
+      "type": "object",
+      "properties": {
+        "parties": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/apiParty"
+          },
+          "description": "A number of parties corresponding to a list operation."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "A cursor to send when retrieving the next page, if any."
+        }
+      },
+      "description": "A list of realtime matches."
     },
     "apiReadStorageObjectId": {
       "type": "object",
@@ -4399,6 +4890,7 @@
         "objectIds": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiReadStorageObjectId"
           },
           "description": "Batch of storage objects."
@@ -4537,6 +5029,16 @@
         "userId": {
           "type": "string",
           "description": "The owner of the object."
+        },
+        "createTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The UNIX time (for gRPC clients) or ISO string (for REST clients) when the object was created."
+        },
+        "updateTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The UNIX time (for gRPC clients) or ISO string (for REST clients) when the object was last updated."
         }
       },
       "description": "A storage acknowledgement."
@@ -4547,6 +5049,7 @@
         "acks": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiStorageObjectAck"
           },
           "description": "Batch of storage write acknowledgements."
@@ -4560,6 +5063,7 @@
         "objects": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiStorageObject"
           },
           "description": "The list of storage objects."
@@ -4577,6 +5081,7 @@
         "objects": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiStorageObject"
           },
           "description": "The batch of storage objects."
@@ -4600,10 +5105,12 @@
       "enum": [
         "APPLE_APP_STORE",
         "GOOGLE_PLAY_STORE",
-        "HUAWEI_APP_GALLERY"
+        "HUAWEI_APP_GALLERY",
+        "FACEBOOK_INSTANT_STORE",
+        "SAMSUNG_GALAXY_STORE"
       ],
       "default": "APPLE_APP_STORE",
-      "description": "- APPLE_APP_STORE: Apple App Store\n - GOOGLE_PLAY_STORE: Google Play Store\n - HUAWEI_APP_GALLERY: Huawei App Gallery",
+      "description": "- APPLE_APP_STORE: Apple App Store\n - GOOGLE_PLAY_STORE: Google Play Store\n - HUAWEI_APP_GALLERY: Huawei App Gallery\n - FACEBOOK_INSTANT_STORE: Facebook Instant Store\n - SAMSUNG_GALAXY_STORE: Samsung Galaxy Store",
       "title": "Validation Provider,"
     },
     "apiSubscriptionList": {
@@ -4612,6 +5119,7 @@
         "validatedSubscriptions": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiValidatedSubscription"
           },
           "description": "Stored validated subscriptions."
@@ -4722,6 +5230,10 @@
         "authoritative": {
           "type": "boolean",
           "description": "Whether the leaderboard was created authoritatively or not."
+        },
+        "joinRequired": {
+          "type": "boolean",
+          "description": "Whether the user must join the tournament before being able to submit scores."
         }
       },
       "description": "A tournament on the server."
@@ -4732,6 +5244,7 @@
         "tournaments": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiTournament"
           },
           "description": "The list of tournaments returned."
@@ -4749,6 +5262,7 @@
         "records": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiLeaderboardRecord"
           },
           "description": "A list of tournament records."
@@ -4756,6 +5270,7 @@
         "ownerRecords": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiLeaderboardRecord"
           },
           "description": "A batched set of tournament records belonging to specified owners."
@@ -4767,6 +5282,11 @@
         "prevCursor": {
           "type": "string",
           "description": "The cursor to send when retrieving the previous page (optional)."
+        },
+        "rankCount": {
+          "type": "string",
+          "format": "int64",
+          "description": "The total number of ranks available."
         }
       },
       "description": "A set of tournament records which may be part of a tournament records page or a batch of individual records."
@@ -4800,36 +5320,6 @@
         }
       },
       "description": "Update a user's account details."
-    },
-    "apiUpdateGroupRequest": {
-      "type": "object",
-      "properties": {
-        "groupId": {
-          "type": "string",
-          "description": "The ID of the group to update."
-        },
-        "name": {
-          "type": "string",
-          "description": "Name."
-        },
-        "description": {
-          "type": "string",
-          "description": "Description string."
-        },
-        "langTag": {
-          "type": "string",
-          "description": "Lang tag."
-        },
-        "avatarUrl": {
-          "type": "string",
-          "description": "Avatar URL."
-        },
-        "open": {
-          "type": "boolean",
-          "description": "Open is true if anyone should be allowed to join, or false if joins must be approved by a group admin."
-        }
-      },
-      "description": "Update fields in a given group."
     },
     "apiUser": {
       "type": "object",
@@ -4918,6 +5408,7 @@
         "userGroups": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/UserGroupListUserGroup"
           },
           "description": "Group-role pairs for a user."
@@ -4935,6 +5426,7 @@
         "users": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiUser"
           },
           "description": "The User objects."
@@ -4955,6 +5447,20 @@
         }
       },
       "title": "Apple IAP Purchases validation request"
+    },
+    "apiValidatePurchaseFacebookInstantRequest": {
+      "type": "object",
+      "properties": {
+        "signedRequest": {
+          "type": "string",
+          "description": "Base64 encoded Facebook Instant signedRequest receipt data payload."
+        },
+        "persist": {
+          "type": "boolean",
+          "title": "Persist the purchase"
+        }
+      },
+      "title": "Facebook Instant IAP Purchase validation request"
     },
     "apiValidatePurchaseGoogleRequest": {
       "type": "object",
@@ -4994,12 +5500,27 @@
         "validatedPurchases": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiValidatedPurchase"
           },
           "description": "Newly seen validated purchases."
         }
       },
       "description": "Validate IAP response."
+    },
+    "apiValidatePurchaseSamsungRequest": {
+      "type": "object",
+      "properties": {
+        "purchaseId": {
+          "type": "string",
+          "description": "The purchase ID returned by the Samsung IAP SDK PurchaseVo."
+        },
+        "persist": {
+          "type": "boolean",
+          "description": "Persist the purchase so that seenBefore can be computed to protect against replay attacks."
+        }
+      },
+      "description": "Samsung IAP Purchase validation request."
     },
     "apiValidateSubscriptionAppleRequest": {
       "type": "object",
@@ -5171,7 +5692,7 @@
         },
         "version": {
           "type": "string",
-          "description": "The version hash of the object to check. Possible values are: [\"\", \"*\", \"#hash#\"]."
+          "description": "The version hash of the object to check. Possible values are: [\"\", \"*\", \"#hash#\"].\n\nif-match and if-none-match"
         },
         "permissionRead": {
           "type": "integer",
@@ -5192,6 +5713,7 @@
         "objects": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/apiWriteStorageObject"
           },
           "description": "The objects to store on the server."
@@ -5199,17 +5721,40 @@
       },
       "description": "Write objects to the storage engine."
     },
+    "nakamaApiEvent": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "An event name, type, category, or identifier."
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Arbitrary event property values."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The time when the event was triggered."
+        },
+        "external": {
+          "type": "boolean",
+          "description": "True if the event came directly from a client call, false otherwise."
+        }
+      },
+      "description": "Represents an event to be passed through the server to registered event handlers."
+    },
     "protobufAny": {
       "type": "object",
       "properties": {
-        "typeUrl": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -5224,6 +5769,7 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }
@@ -5235,7 +5781,9 @@
       "type": "basic"
     },
     "BearerJwt": {
-      "type": ""
+      "type": "apiKey",
+      "name": "Authorization",
+      "in": "header"
     },
     "HttpKeyAuth": {
       "type": "apiKey",

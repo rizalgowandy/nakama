@@ -6,16 +6,14 @@ import (
 	"go/format"
 	"path"
 
-	"github.com/golang/glog"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/internal/descriptor"
 	gen "github.com/grpc-ecosystem/grpc-gateway/v2/internal/generator"
+	"google.golang.org/grpc/grpclog"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
-var (
-	errNoTargetService = errors.New("no target service defined in the file")
-)
+var errNoTargetService = errors.New("no target service defined in the file")
 
 type generator struct {
 	reg                *descriptor.Registry
@@ -24,14 +22,16 @@ type generator struct {
 	registerFuncSuffix string
 	allowPatchFeature  bool
 	standalone         bool
+	useOpaqueAPI       bool
 }
 
 // New returns a new generator which generates grpc gateway files.
 func New(reg *descriptor.Registry, useRequestContext bool, registerFuncSuffix string,
-	allowPatchFeature, standalone bool) gen.Generator {
+	allowPatchFeature, standalone bool, useOpaqueAPI bool) gen.Generator {
 	var imports []descriptor.GoPackage
 	for _, pkgpath := range []string{
 		"context",
+		"errors",
 		"io",
 		"net/http",
 		"github.com/grpc-ecosystem/grpc-gateway/v2/runtime",
@@ -67,17 +67,22 @@ func New(reg *descriptor.Registry, useRequestContext bool, registerFuncSuffix st
 		registerFuncSuffix: registerFuncSuffix,
 		allowPatchFeature:  allowPatchFeature,
 		standalone:         standalone,
+		useOpaqueAPI:       useOpaqueAPI,
 	}
 }
 
 func (g *generator) Generate(targets []*descriptor.File) ([]*descriptor.ResponseFile, error) {
 	var files []*descriptor.ResponseFile
 	for _, file := range targets {
-		glog.V(1).Infof("Processing %s", file.GetName())
+		if grpclog.V(1) {
+			grpclog.Infof("Processing %s", file.GetName())
+		}
 
 		code, err := g.generate(file)
-		if err == errNoTargetService {
-			glog.V(1).Infof("%s: %v", file.GetName(), err)
+		if errors.Is(err, errNoTargetService) {
+			if grpclog.V(1) {
+				grpclog.Infof("%s: %v", file.GetName(), err)
+			}
 			continue
 		}
 		if err != nil {
@@ -85,7 +90,7 @@ func (g *generator) Generate(targets []*descriptor.File) ([]*descriptor.Response
 		}
 		formatted, err := format.Source([]byte(code))
 		if err != nil {
-			glog.Errorf("%v: %s", err, code)
+			grpclog.Errorf("%v: %s", err, code)
 			return nil, err
 		}
 		files = append(files, &descriptor.ResponseFile{
@@ -114,6 +119,7 @@ func (g *generator) generate(file *descriptor.File) (string, error) {
 	for _, svc := range file.Services {
 		for _, m := range svc.Methods {
 			imports = append(imports, g.addEnumPathParamImports(file, m, pkgSeen)...)
+			imports = append(imports, g.addBodyFieldImports(file, m, pkgSeen)...)
 			pkg := m.RequestType.File.GoPkg
 			if len(m.Bindings) == 0 ||
 				pkg == file.GoPkg || pkgSeen[pkg.Path] {
@@ -129,6 +135,7 @@ func (g *generator) generate(file *descriptor.File) (string, error) {
 		UseRequestContext:  g.useRequestContext,
 		RegisterFuncSuffix: g.registerFuncSuffix,
 		AllowPatchFeature:  g.allowPatchFeature,
+		UseOpaqueAPI:       g.useOpaqueAPI,
 	}
 	if g.reg != nil {
 		params.OmitPackageDoc = g.reg.GetOmitPackageDoc()
@@ -153,5 +160,43 @@ func (g *generator) addEnumPathParamImports(file *descriptor.File, m *descriptor
 			imports = append(imports, pkg)
 		}
 	}
+	return imports
+}
+
+// addBodyFieldImports ensures nested body message types pull in their Go packages.
+func (g *generator) addBodyFieldImports(
+	file *descriptor.File,
+	m *descriptor.Method,
+	pkgSeen map[string]bool,
+) []descriptor.GoPackage {
+	if g.reg == nil || !g.useOpaqueAPI {
+		return nil
+	}
+
+	imports := make([]descriptor.GoPackage, 0, len(m.Bindings))
+	for _, b := range m.Bindings {
+		if b.Body == nil || len(b.Body.FieldPath) == 0 {
+			continue
+		}
+
+		target := b.Body.FieldPath[len(b.Body.FieldPath)-1].Target
+		if target == nil || target.GetTypeName() == "" || target.Message == nil {
+			continue
+		}
+
+		msg, err := g.reg.LookupMsg(target.Message.FQMN(), target.GetTypeName())
+		if err != nil {
+			continue
+		}
+
+		pkg := msg.File.GoPkg
+		if pkg == file.GoPkg || pkgSeen[pkg.Path] {
+			continue
+		}
+
+		pkgSeen[pkg.Path] = true
+		imports = append(imports, pkg)
+	}
+
 	return imports
 }

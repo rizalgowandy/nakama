@@ -17,16 +17,19 @@ package server
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
 	"github.com/blugelabs/bluge"
-	"github.com/gofrs/uuid"
-	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/gofrs/uuid/v5"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type MatchmakerPresence struct {
@@ -63,10 +66,11 @@ func (p *MatchmakerPresence) GetReason() runtime.PresenceReason {
 }
 
 type MatchmakerEntry struct {
-	Ticket     string                 `json:"ticket"`
-	Presence   *MatchmakerPresence    `json:"presence"`
-	Properties map[string]interface{} `json:"properties"`
-	PartyId    string                 `json:"party_id"`
+	Ticket     string              `json:"ticket"`
+	Presence   *MatchmakerPresence `json:"presence"`
+	Properties map[string]any      `json:"properties"`
+	PartyId    string              `json:"party_id"`
+	CreateTime int64               `json:"create_time"`
 
 	StringProperties  map[string]string  `json:"-"`
 	NumericProperties map[string]float64 `json:"-"`
@@ -78,20 +82,23 @@ func (m *MatchmakerEntry) GetPresence() runtime.Presence {
 func (m *MatchmakerEntry) GetTicket() string {
 	return m.Ticket
 }
-func (m *MatchmakerEntry) GetProperties() map[string]interface{} {
+func (m *MatchmakerEntry) GetProperties() map[string]any {
 	return m.Properties
 }
 func (m *MatchmakerEntry) GetPartyId() string {
 	return m.PartyId
 }
+func (m *MatchmakerEntry) GetCreateTime() int64 {
+	return m.CreateTime
+}
 
 type MatchmakerIndex struct {
-	Ticket     string                 `json:"ticket"`
-	Properties map[string]interface{} `json:"properties"`
-	MinCount   int                    `json:"min_count"`
-	MaxCount   int                    `json:"max_count"`
-	PartyId    string                 `json:"party_id"`
-	CreatedAt  int64                  `json:"created_at"`
+	Ticket     string         `json:"ticket"`
+	Properties map[string]any `json:"properties"`
+	MinCount   int            `json:"min_count"`
+	MaxCount   int            `json:"max_count"`
+	PartyId    string         `json:"party_id"`
+	CreatedAt  int64          `json:"created_at"`
 
 	// Parameters used for correctly processing various matchmaker operations, but not indexed for searching.
 	Query             string              `json:"-"`
@@ -171,6 +178,7 @@ type Matchmaker interface {
 	Resume()
 	Stop()
 	OnMatchedEntries(fn func(entries [][]*MatchmakerEntry))
+	OnStatsUpdate(fn func(stats *api.MatchmakerStats))
 	Add(ctx context.Context, presences []*MatchmakerPresence, sessionID, partyId, query string, minCount, maxCount, countMultiple int, stringProperties map[string]string, numericProperties map[string]float64) (string, int64, error)
 	Insert(extracts []*MatchmakerExtract) error
 	Extract() []*MatchmakerExtract
@@ -180,6 +188,54 @@ type Matchmaker interface {
 	RemovePartyAll(partyID string) error
 	RemoveAll(node string)
 	Remove(tickets []string)
+	GetStats() *api.MatchmakerStats
+	SetStats(*api.MatchmakerStats)
+}
+
+type MatchmakerStatsEntry struct {
+	CreatedAt   int64 // Unix nanoseconds.
+	CompletedAt int64 // Unix nanoseconds.
+}
+
+type FifoQueue[T any] interface {
+	Insert(T)
+	Clone() []T
+}
+
+type Buffer[T any] struct {
+	mutex  sync.RWMutex
+	values []*T
+}
+
+func NewBuffer(size int) *Buffer[MatchmakerStatsEntry] {
+	return &Buffer[MatchmakerStatsEntry]{
+		mutex:  sync.RWMutex{},
+		values: make([]*MatchmakerStatsEntry, 0, size),
+	}
+}
+
+func (q *Buffer[T]) Insert(v T) {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if len(q.values) < cap(q.values) {
+		q.values = append(q.values, &v)
+		return
+	}
+	// We've reached capacity, remove older entry and insert new one
+	for i := 0; i < len(q.values)-1; i++ {
+		q.values[i] = q.values[i+1]
+	}
+	q.values[len(q.values)-1] = &v
+}
+
+func (q *Buffer[T]) Clone() []T {
+	q.mutex.RLock()
+	defer q.mutex.RUnlock()
+	out := make([]T, len(q.values))
+	for i, v := range q.values {
+		out[i] = *v
+	}
+	return out
 }
 
 type LocalMatchmaker struct {
@@ -197,7 +253,13 @@ type LocalMatchmaker struct {
 	ctxCancelFn context.CancelFunc
 
 	matchedEntriesFn func([][]*MatchmakerEntry)
-	indexWriter      *bluge.Writer
+	statsUpdateFn    func(*api.MatchmakerStats)
+
+	indexWriter *bluge.Writer
+	// Running tally of matchmaker stats.
+	statsCompletions FifoQueue[MatchmakerStatsEntry]
+	// Stats snapshot.
+	statsSnapshot *atomic.Pointer[api.MatchmakerStats]
 	// All tickets for a session ID.
 	sessionTickets map[string]map[string]struct{}
 	// All tickets for a party ID.
@@ -233,12 +295,14 @@ func NewLocalMatchmaker(logger, startupLogger *zap.Logger, config Config, router
 		ctx:         ctx,
 		ctxCancelFn: ctxCancelFn,
 
-		indexWriter:    indexWriter,
-		sessionTickets: make(map[string]map[string]struct{}),
-		partyTickets:   make(map[string]map[string]struct{}),
-		indexes:        make(map[string]*MatchmakerIndex),
-		activeIndexes:  make(map[string]*MatchmakerIndex),
-		revCache:       &MapOf[string, map[string]bool]{},
+		indexWriter:      indexWriter,
+		statsCompletions: NewBuffer(10), // Only keep 10 samples in memory.
+		statsSnapshot:    atomic.NewPointer[api.MatchmakerStats](&api.MatchmakerStats{}),
+		sessionTickets:   make(map[string]map[string]struct{}),
+		partyTickets:     make(map[string]map[string]struct{}),
+		indexes:          make(map[string]*MatchmakerIndex),
+		activeIndexes:    make(map[string]*MatchmakerIndex),
+		revCache:         &MapOf[string, map[string]bool]{},
 	}
 
 	if revThreshold := m.config.GetMatchmaker().RevThreshold; revThreshold > 0 && m.config.GetMatchmaker().RevPrecision {
@@ -279,11 +343,15 @@ func (m *LocalMatchmaker) OnMatchedEntries(fn func(entries [][]*MatchmakerEntry)
 	m.matchedEntriesFn = fn
 }
 
+func (m *LocalMatchmaker) OnStatsUpdate(fn func(*api.MatchmakerStats)) {
+	m.statsUpdateFn = fn
+}
+
 func (m *LocalMatchmaker) Process() {
 	startTime := time.Now()
 	var activeIndexCount, indexCount int
 	defer func() {
-		m.metrics.Matchmaker(float64(indexCount), float64(activeIndexCount), time.Now().Sub(startTime))
+		m.metrics.Matchmaker(float64(indexCount), float64(activeIndexCount), time.Since(startTime))
 	}()
 
 	m.Lock()
@@ -291,19 +359,46 @@ func (m *LocalMatchmaker) Process() {
 	activeIndexCount = len(m.activeIndexes)
 	indexCount = len(m.indexes)
 
+	activeIndexesCopy := make(map[string]*MatchmakerIndex, activeIndexCount)
+	maps.Copy(activeIndexesCopy, m.activeIndexes)
+	var oldestTicketCreatedAt int64
+	indexesCopy := make(map[string]*MatchmakerIndex, indexCount)
+	for ticket, index := range m.indexes {
+		indexesCopy[ticket] = index
+		if oldestTicketCreatedAt == 0 || index.CreatedAt < oldestTicketCreatedAt {
+			oldestTicketCreatedAt = index.CreatedAt
+		}
+	}
+
+	defer func() {
+		completions := m.statsCompletions.Clone()
+
+		compStats := make([]*api.MatchmakerCompletionStats, 0, len(completions))
+		for _, c := range completions {
+			stats := &api.MatchmakerCompletionStats{
+				CreateTime:   timestamppb.New(time.Unix(0, c.CreatedAt)),
+				CompleteTime: timestamppb.New(time.Unix(0, c.CompletedAt)),
+			}
+			compStats = append(compStats, stats)
+		}
+
+		stats := &api.MatchmakerStats{
+			TicketCount: int32(indexCount),
+			Completions: compStats,
+		}
+		if oldestTicketCreatedAt != 0 {
+			stats.OldestTicketCreateTime = timestamppb.New(time.Unix(0, oldestTicketCreatedAt))
+		}
+		m.SetStats(stats)
+		if m.statsUpdateFn != nil {
+			m.statsUpdateFn(stats)
+		}
+	}()
+
 	// No active matchmaking tickets, the pool may be non-empty but there are no new tickets to check/query with.
 	if activeIndexCount == 0 {
 		m.Unlock()
 		return
-	}
-
-	activeIndexesCopy := make(map[string]*MatchmakerIndex, activeIndexCount)
-	for ticket, activeIndex := range m.activeIndexes {
-		activeIndexesCopy[ticket] = activeIndex
-	}
-	indexesCopy := make(map[string]*MatchmakerIndex, indexCount)
-	for ticket, index := range m.indexes {
-		indexesCopy[ticket] = index
 	}
 
 	m.Unlock()
@@ -311,8 +406,10 @@ func (m *LocalMatchmaker) Process() {
 	// Run the custom matching function if one is registered in the runtime, otherwise use the default process function.
 	var matchedEntries [][]*MatchmakerEntry
 	var expiredActiveIndexes []string
-	if m.runtime.matchmakerOverrideFunction != nil {
-		matchedEntries, expiredActiveIndexes = m.processCustom(activeIndexesCopy, indexCount, indexesCopy)
+	if m.runtime.matchmakerProcessorFunction != nil {
+		matchedEntries = m.processCustom(indexesCopy)
+	} else if m.runtime.matchmakerOverrideFunction != nil {
+		matchedEntries, expiredActiveIndexes = m.processOverride(activeIndexesCopy, indexCount, indexesCopy)
 	} else {
 		matchedEntries, expiredActiveIndexes = m.processDefault(activeIndexCount, activeIndexesCopy, indexCount, indexesCopy)
 	}
@@ -349,7 +446,12 @@ func (m *LocalMatchmaker) Process() {
 			}
 			delete(m.indexes, entry.Ticket)
 			delete(m.activeIndexes, entry.Ticket)
-			m.revCache.Delete(entry.Ticket)
+
+			if m.runtime.matchmakerProcessorFunction == nil {
+				// Rev cache not used when custom matchmaking processor is registered.
+				m.revCache.Delete(entry.Ticket)
+			}
+
 			if sessionTickets, ok := m.sessionTickets[entry.Presence.SessionId]; ok {
 				if l := len(sessionTickets); l <= 1 {
 					delete(m.sessionTickets, entry.Presence.SessionId)
@@ -374,8 +476,9 @@ func (m *LocalMatchmaker) Process() {
 	if matchedEntriesCount := len(matchedEntries); matchedEntriesCount > 0 {
 		wg := &sync.WaitGroup{}
 		wg.Add(matchedEntriesCount)
+		ts := time.Now().UnixNano()
 		for _, entries := range matchedEntries {
-			go func(entries []*MatchmakerEntry) {
+			go func(entries []*MatchmakerEntry, ts int64) {
 				var tokenOrMatchID string
 				var isMatchID bool
 				var err error
@@ -383,7 +486,9 @@ func (m *LocalMatchmaker) Process() {
 				// Check if there's a matchmaker matched runtime callback, call it, and see if it returns a match ID.
 				fn := m.runtime.MatchmakerMatched()
 				if fn != nil {
-					tokenOrMatchID, isMatchID, err = fn(context.Background(), entries)
+					fnCtx, fnCtxCancel := context.WithCancel(context.Background())
+					tokenOrMatchID, isMatchID, err = fn(fnCtx, entries)
+					fnCtxCancel()
 					if err != nil {
 						m.logger.Error("Error running Matchmaker Matched hook.", zap.Error(err))
 					}
@@ -424,15 +529,23 @@ func (m *LocalMatchmaker) Process() {
 				}
 
 				for i, entry := range entries {
+					statsEntry := MatchmakerStatsEntry{
+						CreatedAt:   entry.CreateTime,
+						CompletedAt: ts,
+					}
+					m.statsCompletions.Insert(statsEntry)
+
 					// Set per-recipient fields.
 					outgoing.GetMatchmakerMatched().Self = users[i]
 					outgoing.GetMatchmakerMatched().Ticket = entry.Ticket
 					// Route outgoing message.
 					m.router.SendToPresenceIDs(m.logger, []*PresenceID{{Node: entry.Presence.Node, SessionID: entry.Presence.SessionID}}, outgoing, true)
 				}
+
 				wg.Done()
-			}(entries)
+			}(entries, ts)
 		}
+
 		wg.Wait()
 		if m.matchedEntriesFn != nil {
 			go m.matchedEntriesFn(matchedEntries)
@@ -457,7 +570,7 @@ func (m *LocalMatchmaker) Add(ctx context.Context, presences []*MatchmakerPresen
 	}
 
 	// Merge incoming properties.
-	properties := make(map[string]interface{}, len(stringProperties)+len(numericProperties))
+	properties := make(map[string]any, len(stringProperties)+len(numericProperties))
 	for k, v := range stringProperties {
 		properties[k] = v
 	}
@@ -520,17 +633,20 @@ func (m *LocalMatchmaker) Add(ctx context.Context, presences []*MatchmakerPresen
 		}
 	}
 
-	matchmakerIndexDoc, err := MapMatchmakerIndex(ticket, index)
-	if err != nil {
-		m.Unlock()
-		m.logger.Error("error mapping matchmaker index document", zap.Error(err))
-		return "", 0, runtime.ErrMatchmakerIndex
-	}
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Index not used when custom matchmaking processor is registered.
+		matchmakerIndexDoc, err := MapMatchmakerIndex(ticket, index)
+		if err != nil {
+			m.Unlock()
+			m.logger.Error("error mapping matchmaker index document", zap.Error(err))
+			return "", 0, runtime.ErrMatchmakerIndex
+		}
 
-	if err := m.indexWriter.Update(bluge.Identifier(ticket), matchmakerIndexDoc); err != nil {
-		m.Unlock()
-		m.logger.Error("error indexing matchmaker entries", zap.Error(err))
-		return "", 0, runtime.ErrMatchmakerIndex
+		if err := m.indexWriter.Update(bluge.Identifier(ticket), matchmakerIndexDoc); err != nil {
+			m.Unlock()
+			m.logger.Error("error indexing matchmaker entries", zap.Error(err))
+			return "", 0, runtime.ErrMatchmakerIndex
+		}
 	}
 
 	index.Entries = make([]*MatchmakerEntry, 0, len(presences))
@@ -541,6 +657,7 @@ func (m *LocalMatchmaker) Add(ctx context.Context, presences []*MatchmakerPresen
 			m.sessionTickets[presence.SessionId] = map[string]struct{}{ticket: {}}
 		}
 		index.Entries = append(index.Entries, &MatchmakerEntry{
+			CreateTime:        createdAt,
 			Ticket:            ticket,
 			Presence:          presence,
 			Properties:        properties,
@@ -558,9 +675,14 @@ func (m *LocalMatchmaker) Add(ctx context.Context, presences []*MatchmakerPresen
 	}
 	m.indexes[ticket] = index
 	m.activeIndexes[ticket] = index
-	m.revCache.Store(ticket, make(map[string]bool, 10))
+
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Rev cache not used when custom matchmaking processor is registered.
+		m.revCache.Store(ticket, make(map[string]bool, 10))
+	}
 
 	m.Unlock()
+
 	return ticket, createdAt, nil
 }
 
@@ -588,7 +710,7 @@ func (m *LocalMatchmaker) Insert(extracts []*MatchmakerExtract) error {
 			}
 		}
 
-		properties := make(map[string]interface{}, len(extract.StringProperties)+len(extract.NumericProperties))
+		properties := make(map[string]any, len(extract.StringProperties)+len(extract.NumericProperties))
 		for k, v := range extract.StringProperties {
 			properties[k] = v
 		}
@@ -625,13 +747,16 @@ func (m *LocalMatchmaker) Insert(extracts []*MatchmakerExtract) error {
 			ParsedQuery:       parsedQuery,
 		}
 
-		matchmakerIndexDoc, err := MapMatchmakerIndex(extract.Ticket, index)
-		if err != nil {
-			m.logger.Error("error mapping matchmaker index document", zap.Error(err))
-			continue
-		}
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Index not used when custom matchmaking processor is registered.
+			matchmakerIndexDoc, err := MapMatchmakerIndex(extract.Ticket, index)
+			if err != nil {
+				m.logger.Error("error mapping matchmaker index document", zap.Error(err))
+				continue
+			}
 
-		batch.Insert(matchmakerIndexDoc)
+			batch.Insert(matchmakerIndexDoc)
+		}
 
 		index.Entries = make([]*MatchmakerEntry, 0, len(extract.Presences))
 		for _, presence := range extract.Presences {
@@ -640,6 +765,7 @@ func (m *LocalMatchmaker) Insert(extracts []*MatchmakerExtract) error {
 				Presence:          presence,
 				Properties:        properties,
 				PartyId:           extract.PartyId,
+				CreateTime:        extract.CreatedAt,
 				StringProperties:  extract.StringProperties,
 				NumericProperties: extract.NumericProperties,
 			})
@@ -649,14 +775,22 @@ func (m *LocalMatchmaker) Insert(extracts []*MatchmakerExtract) error {
 
 	m.Lock()
 
-	if err := m.indexWriter.Batch(batch); err != nil {
-		m.Unlock()
-		m.logger.Error("error indexing matchmaker entries", zap.Error(err))
-		return runtime.ErrMatchmakerIndex
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Index not used when custom matchmaking processor is registered.
+		if err := m.indexWriter.Batch(batch); err != nil {
+			m.Unlock()
+			m.logger.Error("error indexing matchmaker entries", zap.Error(err))
+			return runtime.ErrMatchmakerIndex
+		}
 	}
 	for ticket, index := range indexes {
 		m.indexes[ticket] = index
-		m.revCache.Store(ticket, make(map[string]bool, 10))
+
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Rev cache not used when custom matchmaking processor is registered.
+			m.revCache.Store(ticket, make(map[string]bool, 10))
+		}
+
 		if index.Intervals < m.config.GetMatchmaker().MaxIntervals {
 			m.activeIndexes[ticket] = index
 		}
@@ -754,15 +888,20 @@ func (m *LocalMatchmaker) RemoveSession(sessionID, ticket string) error {
 	}
 
 	delete(m.activeIndexes, ticket)
-	m.revCache.Delete(ticket)
 
-	if err := m.indexWriter.Delete(bluge.Identifier(ticket)); err != nil {
-		m.Unlock()
-		m.logger.Error("error deleting matchmaker entries", zap.Error(err))
-		return runtime.ErrMatchmakerDelete
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Rev cache and index not used when custom matchmaking processor is registered.
+		m.revCache.Delete(ticket)
+
+		if err := m.indexWriter.Delete(bluge.Identifier(ticket)); err != nil {
+			m.Unlock()
+			m.logger.Error("error deleting matchmaker entries", zap.Error(err))
+			return runtime.ErrMatchmakerDelete
+		}
 	}
 
 	m.Unlock()
+
 	return nil
 }
 
@@ -780,7 +919,10 @@ func (m *LocalMatchmaker) RemoveSessionAll(sessionID string) error {
 	delete(m.sessionTickets, sessionID)
 
 	for ticket := range sessionTickets {
-		batch.Delete(bluge.Identifier(ticket))
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Index not used when custom matchmaking processor is registered.
+			batch.Delete(bluge.Identifier(ticket))
+		}
 
 		index, ok := m.indexes[ticket]
 		if !ok {
@@ -791,7 +933,11 @@ func (m *LocalMatchmaker) RemoveSessionAll(sessionID string) error {
 		delete(m.indexes, ticket)
 
 		delete(m.activeIndexes, ticket)
-		m.revCache.Delete(ticket)
+
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Rev cache not used when custom matchmaking processor is registered.
+			m.revCache.Delete(ticket)
+		}
 
 		for _, entry := range index.Entries {
 			if entry.Presence.SessionId == sessionID {
@@ -818,12 +964,18 @@ func (m *LocalMatchmaker) RemoveSessionAll(sessionID string) error {
 		}
 	}
 
-	err := m.indexWriter.Batch(batch)
-	m.Unlock()
-	if err != nil {
-		m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
-		return runtime.ErrMatchmakerDelete
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Index not used when custom matchmaking processor is registered.
+		err := m.indexWriter.Batch(batch)
+		m.Unlock()
+		if err != nil {
+			m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
+			return runtime.ErrMatchmakerDelete
+		}
+	} else {
+		m.Unlock()
 	}
+
 	return nil
 }
 
@@ -857,15 +1009,20 @@ func (m *LocalMatchmaker) RemoveParty(partyID, ticket string) error {
 	}
 
 	delete(m.activeIndexes, ticket)
-	m.revCache.Delete(ticket)
 
-	if err := m.indexWriter.Delete(bluge.Identifier(ticket)); err != nil {
-		m.Unlock()
-		m.logger.Error("error deleting matchmaker entries", zap.Error(err))
-		return runtime.ErrMatchmakerDelete
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Rev cache and index not used when custom matchmaking processor is registered.
+		m.revCache.Delete(ticket)
+
+		if err := m.indexWriter.Delete(bluge.Identifier(ticket)); err != nil {
+			m.Unlock()
+			m.logger.Error("error deleting matchmaker entries", zap.Error(err))
+			return runtime.ErrMatchmakerDelete
+		}
 	}
 
 	m.Unlock()
+
 	return nil
 }
 
@@ -883,7 +1040,10 @@ func (m *LocalMatchmaker) RemovePartyAll(partyID string) error {
 	delete(m.partyTickets, partyID)
 
 	for ticket := range partyTickets {
-		batch.Delete(bluge.Identifier(ticket))
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Index not used when custom matchmaking processor is registered.
+			batch.Delete(bluge.Identifier(ticket))
+		}
 
 		partyIndex, ok := m.indexes[ticket]
 		if !ok {
@@ -894,7 +1054,11 @@ func (m *LocalMatchmaker) RemovePartyAll(partyID string) error {
 		delete(m.indexes, ticket)
 
 		delete(m.activeIndexes, ticket)
-		m.revCache.Delete(ticket)
+
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Rev cache not used when custom matchmaking processor is registered.
+			m.revCache.Delete(ticket)
+		}
 
 		for _, entry := range partyIndex.Entries {
 			if sessionTickets, ok := m.sessionTickets[entry.Presence.SessionId]; ok {
@@ -907,12 +1071,18 @@ func (m *LocalMatchmaker) RemovePartyAll(partyID string) error {
 		}
 	}
 
-	err := m.indexWriter.Batch(batch)
-	m.Unlock()
-	if err != nil {
-		m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
-		return runtime.ErrMatchmakerDelete
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Index not used when custom matchmaking processor is registered.
+		err := m.indexWriter.Batch(batch)
+		m.Unlock()
+		if err != nil {
+			m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
+			return runtime.ErrMatchmakerDelete
+		}
+	} else {
+		m.Unlock()
 	}
+
 	return nil
 }
 
@@ -927,13 +1097,20 @@ func (m *LocalMatchmaker) RemoveAll(node string) {
 			continue
 		}
 
-		batch.Delete(bluge.Identifier(ticket))
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Index not used when custom matchmaking processor is registered.
+			batch.Delete(bluge.Identifier(ticket))
+		}
 
 		removedCount++
 		delete(m.indexes, ticket)
 
 		delete(m.activeIndexes, ticket)
-		m.revCache.Delete(ticket)
+
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Rev cache not used when custom matchmaking processor is registered.
+			m.revCache.Delete(ticket)
+		}
 
 		if index.PartyId != "" {
 			partyTickets, ok := m.partyTickets[index.PartyId]
@@ -962,10 +1139,15 @@ func (m *LocalMatchmaker) RemoveAll(node string) {
 		return
 	}
 
-	err := m.indexWriter.Batch(batch)
-	m.Unlock()
-	if err != nil {
-		m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Index not used when custom matchmaking processor is registered.
+		err := m.indexWriter.Batch(batch)
+		m.Unlock()
+		if err != nil {
+			m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
+		}
+	} else {
+		m.Unlock()
 	}
 }
 
@@ -981,13 +1163,20 @@ func (m *LocalMatchmaker) Remove(tickets []string) {
 			continue
 		}
 
-		batch.Delete(bluge.Identifier(ticket))
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Index not used when custom matchmaking processor is registered.
+			batch.Delete(bluge.Identifier(ticket))
+		}
 
 		removedCount++
 		delete(m.indexes, ticket)
 
 		delete(m.activeIndexes, ticket)
-		m.revCache.Delete(ticket)
+
+		if m.runtime.matchmakerProcessorFunction == nil {
+			// Rev cache not used when custom matchmaking processor is registered.
+			m.revCache.Delete(ticket)
+		}
 
 		if index.PartyId != "" {
 			partyTickets, ok := m.partyTickets[index.PartyId]
@@ -1016,11 +1205,27 @@ func (m *LocalMatchmaker) Remove(tickets []string) {
 		return
 	}
 
-	err := m.indexWriter.Batch(batch)
-	m.Unlock()
-	if err != nil {
-		m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
+	if m.runtime.matchmakerProcessorFunction == nil {
+		// Index not used when custom matchmaking processor is registered.
+		err := m.indexWriter.Batch(batch)
+		m.Unlock()
+		if err != nil {
+			m.logger.Error("error deleting matchmaker entries batch", zap.Error(err))
+		}
+	} else {
+		m.Unlock()
 	}
+}
+
+func (m *LocalMatchmaker) GetStats() *api.MatchmakerStats {
+	return m.statsSnapshot.Load()
+}
+
+func (m *LocalMatchmaker) SetStats(stats *api.MatchmakerStats) {
+	if stats == nil {
+		return
+	}
+	m.statsSnapshot.Store(stats)
 }
 
 func MapMatchmakerIndex(id string, in *MatchmakerIndex) (*bluge.Document, error) {
@@ -1033,7 +1238,7 @@ func MapMatchmakerIndex(id string, in *MatchmakerIndex) (*bluge.Document, error)
 	rv.AddField(bluge.NewNumericField("created_at", float64(in.CreatedAt)).StoreValue())
 
 	if in.Properties != nil {
-		BlugeWalkDocument(in.Properties, []string{"properties"}, rv)
+		BlugeWalkDocument(in.Properties, []string{"properties"}, map[string]bool{}, rv)
 	}
 
 	return rv, nil

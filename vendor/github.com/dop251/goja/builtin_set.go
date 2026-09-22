@@ -109,6 +109,22 @@ func (so *setObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objec
 	return nil
 }
 
+func (r *Runtime) newSet(prototype *Object) *setObject {
+	o := &Object{runtime: r}
+	so := &setObject{}
+	so.class = classObject
+	so.val = o
+	so.extensible = true
+	o.self = so
+	so.prototype = prototype
+	so.init()
+	return so
+}
+
+func (r *Runtime) newSetObject() *setObject {
+	return r.newSet(r.getSetPrototype())
+}
+
 func (r *Runtime) setProto_add(call FunctionCall) Value {
 	thisObj := r.toObject(call.This)
 	so, ok := thisObj.self.(*setObject)
@@ -188,6 +204,215 @@ func (r *Runtime) setProto_getSize(call FunctionCall) Value {
 	return intToValue(int64(so.m.size))
 }
 
+func (r *Runtime) setProto_difference(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.difference called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+	result := r.newSetObject()
+	// 4. Let resultSetData be a copy of set.[[SetData]].
+
+	// 5. If SetDataSize(set.[[SetData]]) ≤ otherRecord.[[Size]], then
+	if so.m.size <= otherRecord.size {
+		// We can skip the copy if we are certain that the other set is a native Set object
+		if otherRecord.isStd() {
+			otherSet := otherRecord.stdObj
+			iter := so.m.newIter()
+			for {
+				entry := iter.next()
+				if entry == nil {
+					break
+				}
+				if !otherSet.m.has(entry.key) {
+					result.m.set(entry.key, nil)
+				}
+			}
+		} else {
+			so.m.copyTo(result.m)
+			iter := so.m.newIter()
+			for {
+				entry := iter.next()
+				if entry == nil {
+					break
+				}
+				if otherRecord.has(entry.key) {
+					result.m.remove(entry.key)
+				}
+			}
+		}
+	} else {
+		so.m.copyTo(result.m)
+		otherRecord.iterateKeys(func(key Value) bool {
+			result.m.remove(key)
+			return true
+		})
+	}
+	return result.val
+}
+
+func (r *Runtime) setProto_intersection(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.intersection called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+	result := r.newSetObject()
+
+	if so.m.size <= otherRecord.size {
+		iter := so.m.newIter()
+		for {
+			entry := iter.next()
+			if entry == nil {
+				break
+			}
+			if otherRecord.has(entry.key) {
+				result.m.set(entry.key, nil)
+			}
+		}
+	} else {
+		otherRecord.iterateKeys(func(key Value) bool {
+			if so.m.has(key) {
+				result.m.set(key, nil)
+			}
+			return true
+		})
+	}
+	return result.val
+}
+
+func (r *Runtime) setProto_isDisjointFrom(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.isDisjointFrom called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+
+	if so.m.size <= otherRecord.size {
+		iter := so.m.newIter()
+		for {
+			entry := iter.next()
+			if entry == nil {
+				break
+			}
+			if otherRecord.has(entry.key) {
+				return valueFalse
+			}
+		}
+		return valueTrue
+	}
+
+	result := valueTrue
+	otherRecord.iterateKeys(func(key Value) bool {
+		if so.m.has(key) {
+			result = valueFalse
+			return false
+		}
+		return true
+	})
+	return result
+}
+
+func (r *Runtime) setProto_isSubsetOf(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.isSubsetOf called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+
+	if so.m.size > otherRecord.size {
+		return valueFalse
+	}
+
+	iter := so.m.newIter()
+	for {
+		entry := iter.next()
+		if entry == nil {
+			break
+		}
+		if !otherRecord.has(entry.key) {
+			return valueFalse
+		}
+	}
+	return valueTrue
+}
+
+func (r *Runtime) setProto_isSupersetOf(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.isSupersetOf called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+
+	if so.m.size < otherRecord.size {
+		return valueFalse
+	}
+
+	result := valueTrue
+	otherRecord.iterateKeys(func(key Value) bool {
+		if !so.m.has(key) {
+			result = valueFalse
+			return false
+		}
+		return true
+	})
+	return result
+}
+
+func (r *Runtime) setProto_symmetricDifference(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.symmetricDifference called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+	result := r.newSetObject()
+	so.m.copyTo(result.m)
+
+	otherRecord.iterateKeys(func(key Value) bool {
+		// ii. Let resultIndex be SetDataIndex(resultSetData, next).
+		// iii. If resultIndex is not-found, let alreadyInResult be false; else let alreadyInResult be true.
+		alreadyInResult := result.m.has(key)
+		// iv. If SetDataHas(set.[[SetData]], next) is true, then
+		if so.m.has(key) {
+			// 1. If alreadyInResult is true, set resultSetData[resultIndex] to empty.
+			if alreadyInResult {
+				result.m.remove(key)
+			}
+			// v. Else,
+		} else {
+			// 1. If alreadyInResult is false, append next to resultSetData.
+			if !alreadyInResult {
+				result.m.set(key, nil)
+			}
+		}
+		return true
+	})
+	return result.val
+}
+
+func (r *Runtime) setProto_union(call FunctionCall) Value {
+	thisObj := r.toObject(call.This)
+	so, ok := thisObj.self.(*setObject)
+	if !ok {
+		panic(r.NewTypeError("Method Set.prototype.union called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
+	}
+	otherRecord := r.getSetRecord(call.Argument(0))
+	result := r.newSetObject()
+	so.m.copyTo(result.m)
+
+	otherRecord.iterateKeys(func(key Value) bool {
+		result.m.set(key, nil)
+		return true
+	})
+	return result.val
+}
+
 func (r *Runtime) setProto_values(call FunctionCall) Value {
 	return r.createSetIterator(call.This, iterationKindValue)
 }
@@ -197,31 +422,36 @@ func (r *Runtime) builtin_newSet(args []Value, newTarget *Object) *Object {
 		panic(r.needNew("Set"))
 	}
 	proto := r.getPrototypeFromCtor(newTarget, r.global.Set, r.global.SetPrototype)
-	o := &Object{runtime: r}
-
-	so := &setObject{}
-	so.class = classSet
-	so.val = o
-	so.extensible = true
-	o.self = so
-	so.prototype = proto
-	so.init()
+	so := r.newSet(proto)
+	o := so.val
 	if len(args) > 0 {
 		if arg := args[0]; arg != nil && arg != _undefined && arg != _null {
 			adder := so.getStr("add", nil)
-			iter := r.getIterator(arg, nil)
+			stdArr := r.checkStdArrayIter(arg)
 			if adder == r.global.setAdder {
-				iter.iterate(func(item Value) {
-					so.m.set(item, nil)
-				})
+				if stdArr != nil {
+					for _, v := range stdArr.values {
+						so.m.set(v, nil)
+					}
+				} else {
+					r.getIterator(arg, nil).iterate(func(item Value) {
+						so.m.set(item, nil)
+					})
+				}
 			} else {
 				adderFn := toMethod(adder)
 				if adderFn == nil {
 					panic(r.NewTypeError("Set.add in missing"))
 				}
-				iter.iterate(func(item Value) {
-					adderFn(FunctionCall{This: o, Arguments: []Value{item}})
-				})
+				if stdArr != nil {
+					for _, item := range stdArr.values {
+						adderFn(FunctionCall{This: o, Arguments: []Value{item}})
+					}
+				} else {
+					r.getIterator(arg, nil).iterate(func(item Value) {
+						adderFn(FunctionCall{This: o, Arguments: []Value{item}})
+					})
+				}
 			}
 		}
 	}
@@ -241,11 +471,11 @@ func (r *Runtime) createSetIterator(setValue Value, kind iterationKind) Value {
 		iter: setObj.m.newIter(),
 		kind: kind,
 	}
-	si.class = classSetIterator
+	si.class = classObject
 	si.val = o
 	si.extensible = true
 	o.self = si
-	si.prototype = r.global.SetIteratorPrototype
+	si.prototype = r.getSetIteratorPrototype()
 	si.init()
 
 	return o
@@ -259,55 +489,172 @@ func (r *Runtime) setIterProto_next(call FunctionCall) Value {
 	panic(r.NewTypeError("Method Set Iterator.prototype.next called on incompatible receiver %s", r.objectproto_toString(FunctionCall{This: thisObj})))
 }
 
+type setRecord struct {
+	o           *Object
+	size        int
+	has         func(Value) bool
+	iterateKeys func(func(Value) bool)
+	stdObj      *setObject
+}
+
+func (sr *setRecord) isStd() bool {
+	return sr.stdObj != nil
+}
+
+func (r *Runtime) getSetRecord(value Value) *setRecord {
+	// 1. If obj is not an Object, throw a TypeError exception.
+	o, ok := value.(*Object)
+	if !ok {
+		panic(r.NewTypeError("value is not an Object"))
+	}
+
+	// 2. Let rawSize be ? Get(obj, "size").
+	rawSize := nilSafe(o.self.getStr("size", nil))
+	// 3. Let numberSize be ? ToNumber(rawSize).
+	// 4. NOTE: If rawSize is undefined, then numberSize will be NaN.
+	numberSize := rawSize.ToNumber()
+	// 5. If numberSize is NaN, throw a TypeError exception.
+	if IsNaN(numberSize) {
+		panic(r.NewTypeError("size is NaN"))
+	}
+	// 6. Let intSize be ! ToIntegerOrInfinity(numberSize).
+	intSize := toInt(numberSize)
+	// 7. If intSize < 0, throw a RangeError exception.
+	if intSize < 0 {
+		panic(r.newErrorf(r.getRangeError(), "Invalid size: %d", intSize))
+	}
+
+	// 8. Let has be ? Get(obj, "has").
+	has := o.self.getStr("has", nil)
+	// 9. If IsCallable(has) is false, throw a TypeError exception.
+	hasFn := toMethod(has)
+	if hasFn == nil {
+		panic(r.NewTypeError("Object does not have a valid 'has' method"))
+	}
+
+	// 10. Let keys be ? Get(obj, "keys").
+	keys := o.self.getStr("keys", nil)
+	// 11. If IsCallable(keys) is false, throw a TypeError exception.
+	keysFn := toMethod(keys)
+	if keysFn == nil {
+		panic(r.NewTypeError("Object does not have a valid 'keys' method"))
+	}
+
+	// 12. Return a new Set Record { [[SetObject]]: obj, [[Size]]: intSize, [[Has]]: has, [[Keys]]: keys }.
+
+	// common case for native Set objects
+	if setObj, ok := o.self.(*setObject); ok && has == r.global.setHas && keys == r.global.setValues {
+		return &setRecord{
+			o:      o,
+			size:   intSize,
+			stdObj: setObj,
+			has:    setObj.m.has,
+			iterateKeys: func(f func(Value) bool) {
+				iter := setObj.m.newIter()
+				for {
+					entry := iter.next()
+					if entry == nil {
+						break
+					}
+					if !f(entry.key) {
+						break
+					}
+				}
+			},
+		}
+	}
+
+	return &setRecord{
+		o:    o,
+		size: intSize,
+		has: func(v Value) bool {
+			return nilSafe(hasFn(FunctionCall{This: o, Arguments: []Value{v}})).ToBoolean()
+		},
+		iterateKeys: func(f func(Value) bool) {
+			r.forOfMethod(o, keysFn, f)
+		},
+	}
+}
+
 func (r *Runtime) createSetProto(val *Object) objectImpl {
 	o := newBaseObjectObj(val, r.global.ObjectPrototype, classObject)
 
-	o._putProp("constructor", r.global.Set, true, false, true)
-	r.global.setAdder = r.newNativeFunc(r.setProto_add, nil, "add", nil, 1)
+	o._putProp("constructor", r.getSet(), true, false, true)
+	r.global.setAdder = r.newNativeFunc(r.setProto_add, "add", 1)
 	o._putProp("add", r.global.setAdder, true, false, true)
 
-	o._putProp("clear", r.newNativeFunc(r.setProto_clear, nil, "clear", nil, 0), true, false, true)
-	o._putProp("delete", r.newNativeFunc(r.setProto_delete, nil, "delete", nil, 1), true, false, true)
-	o._putProp("forEach", r.newNativeFunc(r.setProto_forEach, nil, "forEach", nil, 1), true, false, true)
-	o._putProp("has", r.newNativeFunc(r.setProto_has, nil, "has", nil, 1), true, false, true)
+	o._putProp("clear", r.newNativeFunc(r.setProto_clear, "clear", 0), true, false, true)
+	o._putProp("delete", r.newNativeFunc(r.setProto_delete, "delete", 1), true, false, true)
+	o._putProp("forEach", r.newNativeFunc(r.setProto_forEach, "forEach", 1), true, false, true)
+	r.global.setHas = r.newNativeFunc(r.setProto_has, "has", 1)
+	o._putProp("has", r.global.setHas, true, false, true)
 	o.setOwnStr("size", &valueProperty{
-		getterFunc:   r.newNativeFunc(r.setProto_getSize, nil, "get size", nil, 0),
+		getterFunc:   r.newNativeFunc(r.setProto_getSize, "get size", 0),
 		accessor:     true,
 		writable:     true,
 		configurable: true,
 	}, true)
 
-	valuesFunc := r.newNativeFunc(r.setProto_values, nil, "values", nil, 0)
-	o._putProp("values", valuesFunc, true, false, true)
-	o._putProp("keys", valuesFunc, true, false, true)
-	o._putProp("entries", r.newNativeFunc(r.setProto_entries, nil, "entries", nil, 0), true, false, true)
-	o._putSym(SymIterator, valueProp(valuesFunc, true, false, true))
+	o._putProp("difference", r.newNativeFunc(r.setProto_difference, "difference", 1), true, false, true)
+	o._putProp("intersection", r.newNativeFunc(r.setProto_intersection, "intersection", 1), true, false, true)
+	o._putProp("isDisjointFrom", r.newNativeFunc(r.setProto_isDisjointFrom, "isDisjointFrom", 1), true, false, true)
+	o._putProp("isSubsetOf", r.newNativeFunc(r.setProto_isSubsetOf, "isSubsetOf", 1), true, false, true)
+	o._putProp("isSupersetOf", r.newNativeFunc(r.setProto_isSupersetOf, "isSupersetOf", 1), true, false, true)
+	o._putProp("symmetricDifference", r.newNativeFunc(r.setProto_symmetricDifference, "symmetricDifference", 1), true, false, true)
+	o._putProp("union", r.newNativeFunc(r.setProto_union, "union", 1), true, false, true)
+
+	r.global.setValues = r.newNativeFunc(r.setProto_values, "values", 0)
+	o._putProp("values", r.global.setValues, true, false, true)
+	o._putProp("keys", r.global.setValues, true, false, true)
+	o._putProp("entries", r.newNativeFunc(r.setProto_entries, "entries", 0), true, false, true)
+	o._putSym(SymIterator, valueProp(r.global.setValues, true, false, true))
 	o._putSym(SymToStringTag, valueProp(asciiString(classSet), false, false, true))
 
 	return o
 }
 
 func (r *Runtime) createSet(val *Object) objectImpl {
-	o := r.newNativeConstructOnly(val, r.builtin_newSet, r.global.SetPrototype, "Set", 0)
+	o := r.newNativeConstructOnly(val, r.builtin_newSet, r.getSetPrototype(), "Set", 0)
 	r.putSpeciesReturnThis(o)
 
 	return o
 }
 
 func (r *Runtime) createSetIterProto(val *Object) objectImpl {
-	o := newBaseObjectObj(val, r.global.IteratorPrototype, classObject)
+	o := newBaseObjectObj(val, r.getIteratorPrototype(), classObject)
 
-	o._putProp("next", r.newNativeFunc(r.setIterProto_next, nil, "next", nil, 0), true, false, true)
+	o._putProp("next", r.newNativeFunc(r.setIterProto_next, "next", 0), true, false, true)
 	o._putSym(SymToStringTag, valueProp(asciiString(classSetIterator), false, false, true))
 
 	return o
 }
 
-func (r *Runtime) initSet() {
-	r.global.SetIteratorPrototype = r.newLazyObject(r.createSetIterProto)
+func (r *Runtime) getSetIteratorPrototype() *Object {
+	var o *Object
+	if o = r.global.SetIteratorPrototype; o == nil {
+		o = &Object{runtime: r}
+		r.global.SetIteratorPrototype = o
+		o.self = r.createSetIterProto(o)
+	}
+	return o
+}
 
-	r.global.SetPrototype = r.newLazyObject(r.createSetProto)
-	r.global.Set = r.newLazyObject(r.createSet)
+func (r *Runtime) getSetPrototype() *Object {
+	ret := r.global.SetPrototype
+	if ret == nil {
+		ret = &Object{runtime: r}
+		r.global.SetPrototype = ret
+		ret.self = r.createSetProto(ret)
+	}
+	return ret
+}
 
-	r.addToGlobal("Set", r.global.Set)
+func (r *Runtime) getSet() *Object {
+	ret := r.global.Set
+	if ret == nil {
+		ret = &Object{runtime: r}
+		r.global.Set = ret
+		ret.self = r.createSet(ret)
+	}
+	return ret
 }

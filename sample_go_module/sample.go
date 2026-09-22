@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/http"
 
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
@@ -54,7 +56,40 @@ func InitModule(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runti
 		return err
 	}
 
+	if err := initializer.RegisterHttp("/test", func(w http.ResponseWriter, r *http.Request) {
+		// Custom http handler.
+	}); err != nil {
+		return err
+	}
+
+	if err := initializer.RegisterAuthenticateProvider("foo-auth", &authenticationProvider{prefix: "foo-auth"}); err != nil {
+		return err
+	}
+	if err := initializer.RegisterAuthenticateProvider("bar-auth", &authenticationProvider{prefix: "bar-auth"}); err != nil {
+		return err
+	}
+	if err := initializer.RegisterAuthenticateProvider("baz-auth", &authenticationProvider{prefix: "baz-auth"}); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+type authenticationProvider struct {
+	prefix string
+}
+
+func (a *authenticationProvider) Authenticate(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload map[string]any) (runtime.AuthenticateProviderResult, error) {
+	return &runtime.DefaultAuthenticateProviderResult{
+		ProviderUserID: fmt.Sprintf("%s:%s", a.prefix, payload["id"]),
+		Username:       fmt.Sprintf("%s:%s", a.prefix, payload["id"]),
+		Vars:           nil,
+		Metadata:       nil,
+	}, nil
+}
+
+func (a *authenticationProvider) GetFriends(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload map[string]any, result runtime.AuthenticateProviderResult) ([]string, bool, error) {
+	return []string{}, false, nil
 }
 
 func rpcEcho(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
@@ -64,7 +99,7 @@ func rpcEcho(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.
 
 func rpcCreateMatch(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 
-	matchID, err := nk.MatchCreate(ctx, "match", map[string]interface{}{})
+	matchID, err := nk.MatchCreate(ctx, "match", map[string]any{})
 
 	if err != nil {
 		return "", err
@@ -89,7 +124,7 @@ type MatchState struct {
 
 type Match struct{}
 
-func (m *Match) MatchInit(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, params map[string]interface{}) (interface{}, int, string) {
+func (m *Match) MatchInit(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, params map[string]any) (any, int, string) {
 	var debug bool
 	if d, ok := params["debug"]; ok {
 		if dv, ok := d.(bool); ok {
@@ -109,7 +144,7 @@ func (m *Match) MatchInit(ctx context.Context, logger runtime.Logger, db *sql.DB
 	return state, tickRate, label
 }
 
-func (m *Match) MatchJoinAttempt(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presence runtime.Presence, metadata map[string]string) (interface{}, bool, string) {
+func (m *Match) MatchJoinAttempt(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state any, presence runtime.Presence, metadata map[string]string) (any, bool, string) {
 	if state.(*MatchState).debug {
 		logger.Info("match join attempt username %v user_id %v session_id %v node %v with metadata %v", presence.GetUsername(), presence.GetUserId(), presence.GetSessionId(), presence.GetNodeId(), metadata)
 	}
@@ -117,7 +152,7 @@ func (m *Match) MatchJoinAttempt(ctx context.Context, logger runtime.Logger, db 
 	return state, true, ""
 }
 
-func (m *Match) MatchJoin(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presences []runtime.Presence) interface{} {
+func (m *Match) MatchJoin(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state any, presences []runtime.Presence) any {
 	if state.(*MatchState).debug {
 		for _, presence := range presences {
 			logger.Info("match join username %v user_id %v session_id %v node %v", presence.GetUsername(), presence.GetUserId(), presence.GetSessionId(), presence.GetNodeId())
@@ -127,7 +162,7 @@ func (m *Match) MatchJoin(ctx context.Context, logger runtime.Logger, db *sql.DB
 	return state
 }
 
-func (m *Match) MatchLeave(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presences []runtime.Presence) interface{} {
+func (m *Match) MatchLeave(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state any, presences []runtime.Presence) any {
 	if state.(*MatchState).debug {
 		for _, presence := range presences {
 			logger.Info("match leave username %v user_id %v session_id %v node %v", presence.GetUsername(), presence.GetUserId(), presence.GetSessionId(), presence.GetNodeId())
@@ -137,7 +172,7 @@ func (m *Match) MatchLeave(ctx context.Context, logger runtime.Logger, db *sql.D
 	return state
 }
 
-func (m *Match) MatchLoop(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, messages []runtime.MatchData) interface{} {
+func (m *Match) MatchLoop(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state any, messages []runtime.MatchData) any {
 	if state.(*MatchState).debug {
 		logger.Info("match loop match_id %v tick %v", ctx.Value(runtime.RUNTIME_CTX_MATCH_ID), tick)
 		logger.Info("match loop match_id %v message count %v", ctx.Value(runtime.RUNTIME_CTX_MATCH_ID), len(messages))
@@ -149,7 +184,7 @@ func (m *Match) MatchLoop(ctx context.Context, logger runtime.Logger, db *sql.DB
 	return state
 }
 
-func (m *Match) MatchTerminate(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, graceSeconds int) interface{} {
+func (m *Match) MatchTerminate(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state any, graceSeconds int) any {
 	if state.(*MatchState).debug {
 		logger.Info("match terminate match_id %v tick %v", ctx.Value(runtime.RUNTIME_CTX_MATCH_ID), tick)
 		logger.Info("match terminate match_id %v grace seconds %v", ctx.Value(runtime.RUNTIME_CTX_MATCH_ID), graceSeconds)
@@ -158,7 +193,7 @@ func (m *Match) MatchTerminate(ctx context.Context, logger runtime.Logger, db *s
 	return state
 }
 
-func (m *Match) MatchSignal(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, data string) (interface{}, string) {
+func (m *Match) MatchSignal(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state any, data string) (any, string) {
 	if state.(*MatchState).debug {
 		logger.Info("match signal match_id %v tick %v", ctx.Value(runtime.RUNTIME_CTX_MATCH_ID), tick)
 		logger.Info("match signal match_id %v data %v", ctx.Value(runtime.RUNTIME_CTX_MATCH_ID), data)

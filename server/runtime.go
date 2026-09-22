@@ -18,13 +18,17 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/heroiclabs/nakama/v3/internal/satori"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -46,170 +50,187 @@ var API_PREFIX_LOWERCASE = strings.ToLower(API_PREFIX)
 var RTAPI_PREFIX_LOWERCASE = strings.ToLower(RTAPI_PREFIX)
 
 type (
-	RuntimeRpcFunction func(ctx context.Context, headers, queryParams map[string][]string, userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang, payload string) (string, error, codes.Code)
+	RuntimeRpcFunction func(ctx context.Context, headers, queryParams map[string][]string, traceID, userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang, payload string) (string, error, codes.Code)
 
-	RuntimeBeforeRtFunction func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, in *rtapi.Envelope) (*rtapi.Envelope, error)
-	RuntimeAfterRtFunction  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, out, in *rtapi.Envelope) error
+	RuntimeBeforeRtFunction func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, in *rtapi.Envelope) (*rtapi.Envelope, error)
+	RuntimeAfterRtFunction  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, out, in *rtapi.Envelope) error
 
-	RuntimeBeforeGetAccountFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) (error, codes.Code)
-	RuntimeAfterGetAccountFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Account) error
-	RuntimeBeforeUpdateAccountFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateAccountRequest) (*api.UpdateAccountRequest, error, codes.Code)
-	RuntimeAfterUpdateAccountFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateAccountRequest) error
-	RuntimeBeforeDeleteAccountFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) (error, codes.Code)
-	RuntimeAfterDeleteAccountFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) error
-	RuntimeBeforeSessionRefreshFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.SessionRefreshRequest) (*api.SessionRefreshRequest, error, codes.Code)
-	RuntimeAfterSessionRefreshFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.SessionRefreshRequest) error
-	RuntimeBeforeSessionLogoutFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.SessionLogoutRequest) (*api.SessionLogoutRequest, error, codes.Code)
-	RuntimeAfterSessionLogoutFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.SessionLogoutRequest) error
-	RuntimeBeforeAuthenticateAppleFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateAppleRequest) (*api.AuthenticateAppleRequest, error, codes.Code)
-	RuntimeAfterAuthenticateAppleFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateAppleRequest) error
-	RuntimeBeforeAuthenticateCustomFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateCustomRequest) (*api.AuthenticateCustomRequest, error, codes.Code)
-	RuntimeAfterAuthenticateCustomFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateCustomRequest) error
-	RuntimeBeforeAuthenticateDeviceFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateDeviceRequest) (*api.AuthenticateDeviceRequest, error, codes.Code)
-	RuntimeAfterAuthenticateDeviceFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateDeviceRequest) error
-	RuntimeBeforeAuthenticateEmailFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateEmailRequest) (*api.AuthenticateEmailRequest, error, codes.Code)
-	RuntimeAfterAuthenticateEmailFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateEmailRequest) error
-	RuntimeBeforeAuthenticateFacebookFunction              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateFacebookRequest) (*api.AuthenticateFacebookRequest, error, codes.Code)
-	RuntimeAfterAuthenticateFacebookFunction               func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateFacebookRequest) error
-	RuntimeBeforeAuthenticateFacebookInstantGameFunction   func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateFacebookInstantGameRequest) (*api.AuthenticateFacebookInstantGameRequest, error, codes.Code)
-	RuntimeAfterAuthenticateFacebookInstantGameFunction    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateFacebookInstantGameRequest) error
-	RuntimeBeforeAuthenticateGameCenterFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateGameCenterRequest) (*api.AuthenticateGameCenterRequest, error, codes.Code)
-	RuntimeAfterAuthenticateGameCenterFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateGameCenterRequest) error
-	RuntimeBeforeAuthenticateGoogleFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateGoogleRequest) (*api.AuthenticateGoogleRequest, error, codes.Code)
-	RuntimeAfterAuthenticateGoogleFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateGoogleRequest) error
-	RuntimeBeforeAuthenticateSteamFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateSteamRequest) (*api.AuthenticateSteamRequest, error, codes.Code)
-	RuntimeAfterAuthenticateSteamFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateSteamRequest) error
-	RuntimeBeforeListChannelMessagesFunction               func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListChannelMessagesRequest) (*api.ListChannelMessagesRequest, error, codes.Code)
-	RuntimeAfterListChannelMessagesFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ChannelMessageList, in *api.ListChannelMessagesRequest) error
-	RuntimeBeforeListFriendsFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListFriendsRequest) (*api.ListFriendsRequest, error, codes.Code)
-	RuntimeAfterListFriendsFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.FriendList) error
-	RuntimeBeforeAddFriendsFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddFriendsRequest) (*api.AddFriendsRequest, error, codes.Code)
-	RuntimeAfterAddFriendsFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddFriendsRequest) error
-	RuntimeBeforeDeleteFriendsFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteFriendsRequest) (*api.DeleteFriendsRequest, error, codes.Code)
-	RuntimeAfterDeleteFriendsFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteFriendsRequest) error
-	RuntimeBeforeBlockFriendsFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BlockFriendsRequest) (*api.BlockFriendsRequest, error, codes.Code)
-	RuntimeAfterBlockFriendsFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BlockFriendsRequest) error
-	RuntimeBeforeImportFacebookFriendsFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportFacebookFriendsRequest) (*api.ImportFacebookFriendsRequest, error, codes.Code)
-	RuntimeAfterImportFacebookFriendsFunction              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportFacebookFriendsRequest) error
-	RuntimeBeforeImportSteamFriendsFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportSteamFriendsRequest) (*api.ImportSteamFriendsRequest, error, codes.Code)
-	RuntimeAfterImportSteamFriendsFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportSteamFriendsRequest) error
-	RuntimeBeforeCreateGroupFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.CreateGroupRequest) (*api.CreateGroupRequest, error, codes.Code)
-	RuntimeAfterCreateGroupFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Group, in *api.CreateGroupRequest) error
-	RuntimeBeforeUpdateGroupFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateGroupRequest) (*api.UpdateGroupRequest, error, codes.Code)
-	RuntimeAfterUpdateGroupFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateGroupRequest) error
-	RuntimeBeforeDeleteGroupFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteGroupRequest) (*api.DeleteGroupRequest, error, codes.Code)
-	RuntimeAfterDeleteGroupFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteGroupRequest) error
-	RuntimeBeforeJoinGroupFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinGroupRequest) (*api.JoinGroupRequest, error, codes.Code)
-	RuntimeAfterJoinGroupFunction                          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinGroupRequest) error
-	RuntimeBeforeLeaveGroupFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LeaveGroupRequest) (*api.LeaveGroupRequest, error, codes.Code)
-	RuntimeAfterLeaveGroupFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LeaveGroupRequest) error
-	RuntimeBeforeAddGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddGroupUsersRequest) (*api.AddGroupUsersRequest, error, codes.Code)
-	RuntimeAfterAddGroupUsersFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddGroupUsersRequest) error
-	RuntimeBeforeBanGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BanGroupUsersRequest) (*api.BanGroupUsersRequest, error, codes.Code)
-	RuntimeAfterBanGroupUsersFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BanGroupUsersRequest) error
-	RuntimeBeforeKickGroupUsersFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.KickGroupUsersRequest) (*api.KickGroupUsersRequest, error, codes.Code)
-	RuntimeAfterKickGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.KickGroupUsersRequest) error
-	RuntimeBeforePromoteGroupUsersFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.PromoteGroupUsersRequest) (*api.PromoteGroupUsersRequest, error, codes.Code)
-	RuntimeAfterPromoteGroupUsersFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.PromoteGroupUsersRequest) error
-	RuntimeBeforeDemoteGroupUsersFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DemoteGroupUsersRequest) (*api.DemoteGroupUsersRequest, error, codes.Code)
-	RuntimeAfterDemoteGroupUsersFunction                   func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DemoteGroupUsersRequest) error
-	RuntimeBeforeListGroupUsersFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListGroupUsersRequest) (*api.ListGroupUsersRequest, error, codes.Code)
-	RuntimeAfterListGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.GroupUserList, in *api.ListGroupUsersRequest) error
-	RuntimeBeforeListUserGroupsFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListUserGroupsRequest) (*api.ListUserGroupsRequest, error, codes.Code)
-	RuntimeAfterListUserGroupsFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.UserGroupList, in *api.ListUserGroupsRequest) error
-	RuntimeBeforeListGroupsFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListGroupsRequest) (*api.ListGroupsRequest, error, codes.Code)
-	RuntimeAfterListGroupsFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.GroupList, in *api.ListGroupsRequest) error
-	RuntimeBeforeDeleteLeaderboardRecordFunction           func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteLeaderboardRecordRequest) (*api.DeleteLeaderboardRecordRequest, error, codes.Code)
-	RuntimeAfterDeleteLeaderboardRecordFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteLeaderboardRecordRequest) error
-	RuntimeBeforeDeleteTournamentRecordFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteTournamentRecordRequest) (*api.DeleteTournamentRecordRequest, error, codes.Code)
-	RuntimeAfterDeleteTournamentRecordFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteTournamentRecordRequest) error
-	RuntimeBeforeListLeaderboardRecordsFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListLeaderboardRecordsRequest) (*api.ListLeaderboardRecordsRequest, error, codes.Code)
-	RuntimeAfterListLeaderboardRecordsFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecordList, in *api.ListLeaderboardRecordsRequest) error
-	RuntimeBeforeWriteLeaderboardRecordFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.WriteLeaderboardRecordRequest) (*api.WriteLeaderboardRecordRequest, error, codes.Code)
-	RuntimeAfterWriteLeaderboardRecordFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecord, in *api.WriteLeaderboardRecordRequest) error
-	RuntimeBeforeListLeaderboardRecordsAroundOwnerFunction func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListLeaderboardRecordsAroundOwnerRequest) (*api.ListLeaderboardRecordsAroundOwnerRequest, error, codes.Code)
-	RuntimeAfterListLeaderboardRecordsAroundOwnerFunction  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecordList, in *api.ListLeaderboardRecordsAroundOwnerRequest) error
-	RuntimeBeforeLinkAppleFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) (*api.AccountApple, error, codes.Code)
-	RuntimeAfterLinkAppleFunction                          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) error
-	RuntimeBeforeLinkCustomFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) (*api.AccountCustom, error, codes.Code)
-	RuntimeAfterLinkCustomFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) error
-	RuntimeBeforeLinkDeviceFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) (*api.AccountDevice, error, codes.Code)
-	RuntimeAfterLinkDeviceFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) error
-	RuntimeBeforeLinkEmailFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) (*api.AccountEmail, error, codes.Code)
-	RuntimeAfterLinkEmailFunction                          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) error
-	RuntimeBeforeLinkFacebookFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkFacebookRequest) (*api.LinkFacebookRequest, error, codes.Code)
-	RuntimeAfterLinkFacebookFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkFacebookRequest) error
-	RuntimeBeforeLinkFacebookInstantGameFunction           func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) (*api.AccountFacebookInstantGame, error, codes.Code)
-	RuntimeAfterLinkFacebookInstantGameFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) error
-	RuntimeBeforeLinkGameCenterFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) (*api.AccountGameCenter, error, codes.Code)
-	RuntimeAfterLinkGameCenterFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) error
-	RuntimeBeforeLinkGoogleFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) (*api.AccountGoogle, error, codes.Code)
-	RuntimeAfterLinkGoogleFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) error
-	RuntimeBeforeLinkSteamFunction                         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkSteamRequest) (*api.LinkSteamRequest, error, codes.Code)
-	RuntimeAfterLinkSteamFunction                          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkSteamRequest) error
-	RuntimeBeforeListMatchesFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListMatchesRequest) (*api.ListMatchesRequest, error, codes.Code)
-	RuntimeAfterListMatchesFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.MatchList, in *api.ListMatchesRequest) error
-	RuntimeBeforeListNotificationsFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListNotificationsRequest) (*api.ListNotificationsRequest, error, codes.Code)
-	RuntimeAfterListNotificationsFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.NotificationList, in *api.ListNotificationsRequest) error
-	RuntimeBeforeDeleteNotificationsFunction               func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteNotificationsRequest) (*api.DeleteNotificationsRequest, error, codes.Code)
-	RuntimeAfterDeleteNotificationsFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteNotificationsRequest) error
-	RuntimeBeforeListStorageObjectsFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListStorageObjectsRequest) (*api.ListStorageObjectsRequest, error, codes.Code)
-	RuntimeAfterListStorageObjectsFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.StorageObjectList, in *api.ListStorageObjectsRequest) error
-	RuntimeBeforeReadStorageObjectsFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ReadStorageObjectsRequest) (*api.ReadStorageObjectsRequest, error, codes.Code)
-	RuntimeAfterReadStorageObjectsFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.StorageObjects, in *api.ReadStorageObjectsRequest) error
-	RuntimeBeforeWriteStorageObjectsFunction               func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.WriteStorageObjectsRequest) (*api.WriteStorageObjectsRequest, error, codes.Code)
-	RuntimeAfterWriteStorageObjectsFunction                func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.StorageObjectAcks, in *api.WriteStorageObjectsRequest) error
-	RuntimeBeforeDeleteStorageObjectsFunction              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteStorageObjectsRequest) (*api.DeleteStorageObjectsRequest, error, codes.Code)
-	RuntimeAfterDeleteStorageObjectsFunction               func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteStorageObjectsRequest) error
-	RuntimeBeforeJoinTournamentFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinTournamentRequest) (*api.JoinTournamentRequest, error, codes.Code)
-	RuntimeAfterJoinTournamentFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinTournamentRequest) error
-	RuntimeBeforeListTournamentRecordsFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListTournamentRecordsRequest) (*api.ListTournamentRecordsRequest, error, codes.Code)
-	RuntimeAfterListTournamentRecordsFunction              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.TournamentRecordList, in *api.ListTournamentRecordsRequest) error
-	RuntimeBeforeListTournamentsFunction                   func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListTournamentsRequest) (*api.ListTournamentsRequest, error, codes.Code)
-	RuntimeAfterListTournamentsFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.TournamentList, in *api.ListTournamentsRequest) error
-	RuntimeBeforeWriteTournamentRecordFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.WriteTournamentRecordRequest) (*api.WriteTournamentRecordRequest, error, codes.Code)
-	RuntimeAfterWriteTournamentRecordFunction              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecord, in *api.WriteTournamentRecordRequest) error
-	RuntimeBeforeListTournamentRecordsAroundOwnerFunction  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListTournamentRecordsAroundOwnerRequest) (*api.ListTournamentRecordsAroundOwnerRequest, error, codes.Code)
-	RuntimeAfterListTournamentRecordsAroundOwnerFunction   func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.TournamentRecordList, in *api.ListTournamentRecordsAroundOwnerRequest) error
-	RuntimeBeforeUnlinkAppleFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) (*api.AccountApple, error, codes.Code)
-	RuntimeAfterUnlinkAppleFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) error
-	RuntimeBeforeUnlinkCustomFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) (*api.AccountCustom, error, codes.Code)
-	RuntimeAfterUnlinkCustomFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) error
-	RuntimeBeforeUnlinkDeviceFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) (*api.AccountDevice, error, codes.Code)
-	RuntimeAfterUnlinkDeviceFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) error
-	RuntimeBeforeUnlinkEmailFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) (*api.AccountEmail, error, codes.Code)
-	RuntimeAfterUnlinkEmailFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) error
-	RuntimeBeforeUnlinkFacebookFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebook) (*api.AccountFacebook, error, codes.Code)
-	RuntimeAfterUnlinkFacebookFunction                     func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebook) error
-	RuntimeBeforeUnlinkFacebookInstantGameFunction         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) (*api.AccountFacebookInstantGame, error, codes.Code)
-	RuntimeAfterUnlinkFacebookInstantGameFunction          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) error
-	RuntimeBeforeUnlinkGameCenterFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) (*api.AccountGameCenter, error, codes.Code)
-	RuntimeAfterUnlinkGameCenterFunction                   func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) error
-	RuntimeBeforeUnlinkGoogleFunction                      func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) (*api.AccountGoogle, error, codes.Code)
-	RuntimeAfterUnlinkGoogleFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) error
-	RuntimeBeforeUnlinkSteamFunction                       func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountSteam) (*api.AccountSteam, error, codes.Code)
-	RuntimeAfterUnlinkSteamFunction                        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountSteam) error
-	RuntimeBeforeGetUsersFunction                          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.GetUsersRequest) (*api.GetUsersRequest, error, codes.Code)
-	RuntimeAfterGetUsersFunction                           func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Users, in *api.GetUsersRequest) error
-	RuntimeBeforeEventFunction                             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.Event) (*api.Event, error, codes.Code)
-	RuntimeAfterEventFunction                              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.Event) error
-	RuntimeBeforeValidatePurchaseAppleFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseAppleRequest) (*api.ValidatePurchaseAppleRequest, error, codes.Code)
-	RuntimeAfterValidatePurchaseAppleFunction              func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseAppleRequest) error
-	RuntimeBeforeValidateSubscriptionAppleFunction         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidateSubscriptionAppleRequest) (*api.ValidateSubscriptionAppleRequest, error, codes.Code)
-	RuntimeAfterValidateSubscriptionAppleFunction          func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidateSubscriptionResponse, in *api.ValidateSubscriptionAppleRequest) error
-	RuntimeBeforeValidatePurchaseGoogleFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseGoogleRequest) (*api.ValidatePurchaseGoogleRequest, error, codes.Code)
-	RuntimeAfterValidatePurchaseGoogleFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseGoogleRequest) error
-	RuntimeBeforeValidateSubscriptionGoogleFunction        func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidateSubscriptionGoogleRequest) (*api.ValidateSubscriptionGoogleRequest, error, codes.Code)
-	RuntimeAfterValidateSubscriptionGoogleFunction         func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidateSubscriptionResponse, in *api.ValidateSubscriptionGoogleRequest) error
-	RuntimeBeforeValidatePurchaseHuaweiFunction            func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseHuaweiRequest) (*api.ValidatePurchaseHuaweiRequest, error, codes.Code)
-	RuntimeAfterValidatePurchaseHuaweiFunction             func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseHuaweiRequest) error
-	RuntimeBeforeListSubscriptionsFunction                 func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListSubscriptionsRequest) (*api.ListSubscriptionsRequest, error, codes.Code)
-	RuntimeAfterListSubscriptionsFunction                  func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.SubscriptionList, in *api.ListSubscriptionsRequest) error
-	RuntimeBeforeGetSubscriptionFunction                   func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.GetSubscriptionRequest) (*api.GetSubscriptionRequest, error, codes.Code)
-	RuntimeAfterGetSubscriptionFunction                    func(ctx context.Context, logger *zap.Logger, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatedSubscription, in *api.GetSubscriptionRequest) error
+	RuntimeBeforeGetAccountFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) (error, codes.Code)
+	RuntimeAfterGetAccountFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Account) error
+	RuntimeBeforeUpdateAccountFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateAccountRequest) (*api.UpdateAccountRequest, error, codes.Code)
+	RuntimeAfterUpdateAccountFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateAccountRequest) error
+	RuntimeBeforeDeleteAccountFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) (error, codes.Code)
+	RuntimeAfterDeleteAccountFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) error
+	RuntimeBeforeSessionRefreshFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.SessionRefreshRequest) (*api.SessionRefreshRequest, error, codes.Code)
+	RuntimeAfterSessionRefreshFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.SessionRefreshRequest) error
+	RuntimeBeforeSessionLogoutFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.SessionLogoutRequest) (*api.SessionLogoutRequest, error, codes.Code)
+	RuntimeAfterSessionLogoutFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.SessionLogoutRequest) error
+	RuntimeBeforeAuthenticateFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateRequest) (*api.AuthenticateRequest, error, codes.Code)
+	RuntimeAfterAuthenticateFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateRequest) error
+	RuntimeBeforeAuthenticateAppleFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateAppleRequest) (*api.AuthenticateAppleRequest, error, codes.Code)
+	RuntimeAfterAuthenticateAppleFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateAppleRequest) error
+	RuntimeBeforeAuthenticateCustomFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateCustomRequest) (*api.AuthenticateCustomRequest, error, codes.Code)
+	RuntimeAfterAuthenticateCustomFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateCustomRequest) error
+	RuntimeBeforeAuthenticateDeviceFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateDeviceRequest) (*api.AuthenticateDeviceRequest, error, codes.Code)
+	RuntimeAfterAuthenticateDeviceFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateDeviceRequest) error
+	RuntimeBeforeAuthenticateEmailFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateEmailRequest) (*api.AuthenticateEmailRequest, error, codes.Code)
+	RuntimeAfterAuthenticateEmailFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateEmailRequest) error
+	RuntimeBeforeAuthenticateFacebookFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateFacebookRequest) (*api.AuthenticateFacebookRequest, error, codes.Code)
+	RuntimeAfterAuthenticateFacebookFunction               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateFacebookRequest) error
+	RuntimeBeforeAuthenticateFacebookInstantGameFunction   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateFacebookInstantGameRequest) (*api.AuthenticateFacebookInstantGameRequest, error, codes.Code)
+	RuntimeAfterAuthenticateFacebookInstantGameFunction    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateFacebookInstantGameRequest) error
+	RuntimeBeforeAuthenticateGameCenterFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateGameCenterRequest) (*api.AuthenticateGameCenterRequest, error, codes.Code)
+	RuntimeAfterAuthenticateGameCenterFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateGameCenterRequest) error
+	RuntimeBeforeAuthenticateGoogleFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateGoogleRequest) (*api.AuthenticateGoogleRequest, error, codes.Code)
+	RuntimeAfterAuthenticateGoogleFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateGoogleRequest) error
+	RuntimeBeforeAuthenticateSteamFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AuthenticateSteamRequest) (*api.AuthenticateSteamRequest, error, codes.Code)
+	RuntimeAfterAuthenticateSteamFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Session, in *api.AuthenticateSteamRequest) error
+	RuntimeBeforeListChannelMessagesFunction               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListChannelMessagesRequest) (*api.ListChannelMessagesRequest, error, codes.Code)
+	RuntimeAfterListChannelMessagesFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ChannelMessageList, in *api.ListChannelMessagesRequest) error
+	RuntimeBeforeListFriendsFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListFriendsRequest) (*api.ListFriendsRequest, error, codes.Code)
+	RuntimeAfterListFriendsFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.FriendList) error
+	RuntimeBeforeListFriendsOfFriendsFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListFriendsOfFriendsRequest) (*api.ListFriendsOfFriendsRequest, error, codes.Code)
+	RuntimeAfterListFriendsOfFriendsFunction               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.FriendsOfFriendsList) error
+	RuntimeBeforeAddFriendsFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddFriendsRequest) (*api.AddFriendsRequest, error, codes.Code)
+	RuntimeAfterAddFriendsFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddFriendsRequest) error
+	RuntimeBeforeDeleteFriendsFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteFriendsRequest) (*api.DeleteFriendsRequest, error, codes.Code)
+	RuntimeAfterDeleteFriendsFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteFriendsRequest) error
+	RuntimeBeforeBlockFriendsFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BlockFriendsRequest) (*api.BlockFriendsRequest, error, codes.Code)
+	RuntimeAfterBlockFriendsFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BlockFriendsRequest) error
+	RuntimeBeforeImportFacebookFriendsFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportFacebookFriendsRequest) (*api.ImportFacebookFriendsRequest, error, codes.Code)
+	RuntimeAfterImportFacebookFriendsFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportFacebookFriendsRequest) error
+	RuntimeBeforeImportSteamFriendsFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportSteamFriendsRequest) (*api.ImportSteamFriendsRequest, error, codes.Code)
+	RuntimeAfterImportSteamFriendsFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ImportSteamFriendsRequest) error
+	RuntimeBeforeCreateGroupFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.CreateGroupRequest) (*api.CreateGroupRequest, error, codes.Code)
+	RuntimeAfterCreateGroupFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Group, in *api.CreateGroupRequest) error
+	RuntimeBeforeUpdateGroupFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateGroupRequest) (*api.UpdateGroupRequest, error, codes.Code)
+	RuntimeAfterUpdateGroupFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.UpdateGroupRequest) error
+	RuntimeBeforeDeleteGroupFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteGroupRequest) (*api.DeleteGroupRequest, error, codes.Code)
+	RuntimeAfterDeleteGroupFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteGroupRequest) error
+	RuntimeBeforeJoinGroupFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinGroupRequest) (*api.JoinGroupRequest, error, codes.Code)
+	RuntimeAfterJoinGroupFunction                          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinGroupRequest) error
+	RuntimeBeforeLeaveGroupFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LeaveGroupRequest) (*api.LeaveGroupRequest, error, codes.Code)
+	RuntimeAfterLeaveGroupFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LeaveGroupRequest) error
+	RuntimeBeforeAddGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddGroupUsersRequest) (*api.AddGroupUsersRequest, error, codes.Code)
+	RuntimeAfterAddGroupUsersFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AddGroupUsersRequest) error
+	RuntimeBeforeBanGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BanGroupUsersRequest) (*api.BanGroupUsersRequest, error, codes.Code)
+	RuntimeAfterBanGroupUsersFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.BanGroupUsersRequest) error
+	RuntimeBeforeKickGroupUsersFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.KickGroupUsersRequest) (*api.KickGroupUsersRequest, error, codes.Code)
+	RuntimeAfterKickGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.KickGroupUsersRequest) error
+	RuntimeBeforePromoteGroupUsersFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.PromoteGroupUsersRequest) (*api.PromoteGroupUsersRequest, error, codes.Code)
+	RuntimeAfterPromoteGroupUsersFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.PromoteGroupUsersRequest) error
+	RuntimeBeforeDemoteGroupUsersFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DemoteGroupUsersRequest) (*api.DemoteGroupUsersRequest, error, codes.Code)
+	RuntimeAfterDemoteGroupUsersFunction                   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DemoteGroupUsersRequest) error
+	RuntimeBeforeListGroupUsersFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListGroupUsersRequest) (*api.ListGroupUsersRequest, error, codes.Code)
+	RuntimeAfterListGroupUsersFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.GroupUserList, in *api.ListGroupUsersRequest) error
+	RuntimeBeforeListUserGroupsFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListUserGroupsRequest) (*api.ListUserGroupsRequest, error, codes.Code)
+	RuntimeAfterListUserGroupsFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.UserGroupList, in *api.ListUserGroupsRequest) error
+	RuntimeBeforeListGroupsFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListGroupsRequest) (*api.ListGroupsRequest, error, codes.Code)
+	RuntimeAfterListGroupsFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.GroupList, in *api.ListGroupsRequest) error
+	RuntimeBeforeDeleteLeaderboardRecordFunction           func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteLeaderboardRecordRequest) (*api.DeleteLeaderboardRecordRequest, error, codes.Code)
+	RuntimeAfterDeleteLeaderboardRecordFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteLeaderboardRecordRequest) error
+	RuntimeBeforeDeleteTournamentRecordFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteTournamentRecordRequest) (*api.DeleteTournamentRecordRequest, error, codes.Code)
+	RuntimeAfterDeleteTournamentRecordFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteTournamentRecordRequest) error
+	RuntimeBeforeListLeaderboardRecordsFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListLeaderboardRecordsRequest) (*api.ListLeaderboardRecordsRequest, error, codes.Code)
+	RuntimeAfterListLeaderboardRecordsFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecordList, in *api.ListLeaderboardRecordsRequest) error
+	RuntimeBeforeWriteLeaderboardRecordFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.WriteLeaderboardRecordRequest) (*api.WriteLeaderboardRecordRequest, error, codes.Code)
+	RuntimeAfterWriteLeaderboardRecordFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecord, in *api.WriteLeaderboardRecordRequest) error
+	RuntimeBeforeListLeaderboardRecordsAroundOwnerFunction func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListLeaderboardRecordsAroundOwnerRequest) (*api.ListLeaderboardRecordsAroundOwnerRequest, error, codes.Code)
+	RuntimeAfterListLeaderboardRecordsAroundOwnerFunction  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecordList, in *api.ListLeaderboardRecordsAroundOwnerRequest) error
+	RuntimeBeforeLinkFunction                              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountProvider) (*api.AccountProvider, error, codes.Code)
+	RuntimeAfterLinkFunction                               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountProvider) error
+	RuntimeBeforeLinkAppleFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) (*api.AccountApple, error, codes.Code)
+	RuntimeAfterLinkAppleFunction                          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) error
+	RuntimeBeforeLinkCustomFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) (*api.AccountCustom, error, codes.Code)
+	RuntimeAfterLinkCustomFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) error
+	RuntimeBeforeLinkDeviceFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) (*api.AccountDevice, error, codes.Code)
+	RuntimeAfterLinkDeviceFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) error
+	RuntimeBeforeLinkEmailFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) (*api.AccountEmail, error, codes.Code)
+	RuntimeAfterLinkEmailFunction                          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) error
+	RuntimeBeforeLinkFacebookFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkFacebookRequest) (*api.LinkFacebookRequest, error, codes.Code)
+	RuntimeAfterLinkFacebookFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkFacebookRequest) error
+	RuntimeBeforeLinkFacebookInstantGameFunction           func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) (*api.AccountFacebookInstantGame, error, codes.Code)
+	RuntimeAfterLinkFacebookInstantGameFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) error
+	RuntimeBeforeLinkGameCenterFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) (*api.AccountGameCenter, error, codes.Code)
+	RuntimeAfterLinkGameCenterFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) error
+	RuntimeBeforeLinkGoogleFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) (*api.AccountGoogle, error, codes.Code)
+	RuntimeAfterLinkGoogleFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) error
+	RuntimeBeforeLinkSteamFunction                         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkSteamRequest) (*api.LinkSteamRequest, error, codes.Code)
+	RuntimeAfterLinkSteamFunction                          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.LinkSteamRequest) error
+	RuntimeBeforeListMatchesFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListMatchesRequest) (*api.ListMatchesRequest, error, codes.Code)
+	RuntimeAfterListMatchesFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.MatchList, in *api.ListMatchesRequest) error
+	RuntimeBeforeListNotificationsFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListNotificationsRequest) (*api.ListNotificationsRequest, error, codes.Code)
+	RuntimeAfterListNotificationsFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.NotificationList, in *api.ListNotificationsRequest) error
+	RuntimeBeforeDeleteNotificationsFunction               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteNotificationsRequest) (*api.DeleteNotificationsRequest, error, codes.Code)
+	RuntimeAfterDeleteNotificationsFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteNotificationsRequest) error
+	RuntimeBeforeListStorageObjectsFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListStorageObjectsRequest) (*api.ListStorageObjectsRequest, error, codes.Code)
+	RuntimeAfterListStorageObjectsFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.StorageObjectList, in *api.ListStorageObjectsRequest) error
+	RuntimeBeforeReadStorageObjectsFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ReadStorageObjectsRequest) (*api.ReadStorageObjectsRequest, error, codes.Code)
+	RuntimeAfterReadStorageObjectsFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.StorageObjects, in *api.ReadStorageObjectsRequest) error
+	RuntimeBeforeWriteStorageObjectsFunction               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.WriteStorageObjectsRequest) (*api.WriteStorageObjectsRequest, error, codes.Code)
+	RuntimeAfterWriteStorageObjectsFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.StorageObjectAcks, in *api.WriteStorageObjectsRequest) error
+	RuntimeBeforeDeleteStorageObjectsFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteStorageObjectsRequest) (*api.DeleteStorageObjectsRequest, error, codes.Code)
+	RuntimeAfterDeleteStorageObjectsFunction               func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.DeleteStorageObjectsRequest) error
+	RuntimeBeforeJoinTournamentFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinTournamentRequest) (*api.JoinTournamentRequest, error, codes.Code)
+	RuntimeAfterJoinTournamentFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.JoinTournamentRequest) error
+	RuntimeBeforeListTournamentRecordsFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListTournamentRecordsRequest) (*api.ListTournamentRecordsRequest, error, codes.Code)
+	RuntimeAfterListTournamentRecordsFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.TournamentRecordList, in *api.ListTournamentRecordsRequest) error
+	RuntimeBeforeListTournamentsFunction                   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListTournamentsRequest) (*api.ListTournamentsRequest, error, codes.Code)
+	RuntimeAfterListTournamentsFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.TournamentList, in *api.ListTournamentsRequest) error
+	RuntimeBeforeWriteTournamentRecordFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.WriteTournamentRecordRequest) (*api.WriteTournamentRecordRequest, error, codes.Code)
+	RuntimeAfterWriteTournamentRecordFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.LeaderboardRecord, in *api.WriteTournamentRecordRequest) error
+	RuntimeBeforeListTournamentRecordsAroundOwnerFunction  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListTournamentRecordsAroundOwnerRequest) (*api.ListTournamentRecordsAroundOwnerRequest, error, codes.Code)
+	RuntimeAfterListTournamentRecordsAroundOwnerFunction   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.TournamentRecordList, in *api.ListTournamentRecordsAroundOwnerRequest) error
+	RuntimeBeforeUnlinkFunction                            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountProvider) (*api.AccountProvider, error, codes.Code)
+	RuntimeAfterUnlinkFunction                             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountProvider) error
+	RuntimeBeforeUnlinkAppleFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) (*api.AccountApple, error, codes.Code)
+	RuntimeAfterUnlinkAppleFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountApple) error
+	RuntimeBeforeUnlinkCustomFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) (*api.AccountCustom, error, codes.Code)
+	RuntimeAfterUnlinkCustomFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountCustom) error
+	RuntimeBeforeUnlinkDeviceFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) (*api.AccountDevice, error, codes.Code)
+	RuntimeAfterUnlinkDeviceFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountDevice) error
+	RuntimeBeforeUnlinkEmailFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) (*api.AccountEmail, error, codes.Code)
+	RuntimeAfterUnlinkEmailFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountEmail) error
+	RuntimeBeforeUnlinkFacebookFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebook) (*api.AccountFacebook, error, codes.Code)
+	RuntimeAfterUnlinkFacebookFunction                     func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebook) error
+	RuntimeBeforeUnlinkFacebookInstantGameFunction         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) (*api.AccountFacebookInstantGame, error, codes.Code)
+	RuntimeAfterUnlinkFacebookInstantGameFunction          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountFacebookInstantGame) error
+	RuntimeBeforeUnlinkGameCenterFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) (*api.AccountGameCenter, error, codes.Code)
+	RuntimeAfterUnlinkGameCenterFunction                   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGameCenter) error
+	RuntimeBeforeUnlinkGoogleFunction                      func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) (*api.AccountGoogle, error, codes.Code)
+	RuntimeAfterUnlinkGoogleFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountGoogle) error
+	RuntimeBeforeUnlinkSteamFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountSteam) (*api.AccountSteam, error, codes.Code)
+	RuntimeAfterUnlinkSteamFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.AccountSteam) error
+	RuntimeBeforeGetUsersFunction                          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.GetUsersRequest) (*api.GetUsersRequest, error, codes.Code)
+	RuntimeAfterGetUsersFunction                           func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.Users, in *api.GetUsersRequest) error
+	RuntimeBeforeEventFunction                             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.Event) (*api.Event, error, codes.Code)
+	RuntimeAfterEventFunction                              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.Event) error
+	RuntimeBeforeValidatePurchaseAppleFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseAppleRequest) (*api.ValidatePurchaseAppleRequest, error, codes.Code)
+	RuntimeAfterValidatePurchaseAppleFunction              func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseAppleRequest) error
+	RuntimeBeforeValidateSubscriptionAppleFunction         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidateSubscriptionAppleRequest) (*api.ValidateSubscriptionAppleRequest, error, codes.Code)
+	RuntimeAfterValidateSubscriptionAppleFunction          func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidateSubscriptionResponse, in *api.ValidateSubscriptionAppleRequest) error
+	RuntimeBeforeValidatePurchaseGoogleFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseGoogleRequest) (*api.ValidatePurchaseGoogleRequest, error, codes.Code)
+	RuntimeAfterValidatePurchaseGoogleFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseGoogleRequest) error
+	RuntimeBeforeValidateSubscriptionGoogleFunction        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidateSubscriptionGoogleRequest) (*api.ValidateSubscriptionGoogleRequest, error, codes.Code)
+	RuntimeAfterValidateSubscriptionGoogleFunction         func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidateSubscriptionResponse, in *api.ValidateSubscriptionGoogleRequest) error
+	RuntimeBeforeValidatePurchaseHuaweiFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseHuaweiRequest) (*api.ValidatePurchaseHuaweiRequest, error, codes.Code)
+	RuntimeAfterValidatePurchaseHuaweiFunction             func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseHuaweiRequest) error
+	RuntimeBeforeValidatePurchaseFacebookInstantFunction   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseFacebookInstantRequest) (*api.ValidatePurchaseFacebookInstantRequest, error, codes.Code)
+	RuntimeAfterValidatePurchaseFacebookInstantFunction    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseFacebookInstantRequest) error
+	RuntimeBeforeValidatePurchaseSamsungFunction           func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ValidatePurchaseSamsungRequest) (*api.ValidatePurchaseSamsungRequest, error, codes.Code)
+	RuntimeAfterValidatePurchaseSamsungFunction            func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatePurchaseResponse, in *api.ValidatePurchaseSamsungRequest) error
+	RuntimeBeforeListSubscriptionsFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListSubscriptionsRequest) (*api.ListSubscriptionsRequest, error, codes.Code)
+	RuntimeAfterListSubscriptionsFunction                  func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.SubscriptionList, in *api.ListSubscriptionsRequest) error
+	RuntimeBeforeGetSubscriptionFunction                   func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.GetSubscriptionRequest) (*api.GetSubscriptionRequest, error, codes.Code)
+	RuntimeAfterGetSubscriptionFunction                    func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.ValidatedSubscription, in *api.GetSubscriptionRequest) error
+	RuntimeBeforeGetMatchmakerStatsFunction                func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string) (error, codes.Code)
+	RuntimeAfterGetMatchmakerStatsFunction                 func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.MatchmakerStats) error
+	RuntimeBeforeListPartiesFunction                       func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, in *api.ListPartiesRequest) (*api.ListPartiesRequest, error, codes.Code)
+	RuntimeAfterListPartiesFunction                        func(ctx context.Context, logger *zap.Logger, traceID, userID, username string, vars map[string]string, expiry int64, clientIP, clientPort string, out *api.PartyList, in *api.ListPartiesRequest) error
 
-	RuntimeMatchmakerMatchedFunction  func(ctx context.Context, entries []*MatchmakerEntry) (string, bool, error)
-	RuntimeMatchmakerOverrideFunction func(ctx context.Context, candidateMatches [][]*MatchmakerEntry) (matches [][]*MatchmakerEntry)
+	RuntimeMatchmakerMatchedFunction   func(ctx context.Context, entries []*MatchmakerEntry) (string, bool, error)
+	RuntimeMatchmakerProcessorFunction func(ctx context.Context, entries []*MatchmakerEntry) (matches [][]*MatchmakerEntry)
+	RuntimeMatchmakerOverrideFunction  func(ctx context.Context, candidateMatches [][]*MatchmakerEntry) (matches [][]*MatchmakerEntry)
 
 	RuntimeMatchCreateFunction       func(ctx context.Context, logger *zap.Logger, id uuid.UUID, node string, stopped *atomic.Bool, name string) (RuntimeMatchCore, error)
 	RuntimeMatchDeferMessageFunction func(msg *DeferredMessage) error
@@ -219,17 +240,26 @@ type (
 
 	RuntimeLeaderboardResetFunction func(ctx context.Context, leaderboard *api.Leaderboard, reset int64) error
 
-	RuntimePurchaseNotificationAppleFunction      func(ctx context.Context, purchase *api.ValidatedPurchase, providerPayload string) error
-	RuntimeSubscriptionNotificationAppleFunction  func(ctx context.Context, subscription *api.ValidatedSubscription, providerPayload string) error
-	RuntimePurchaseNotificationGoogleFunction     func(ctx context.Context, purchase *api.ValidatedPurchase, providerPayload string) error
-	RuntimeSubscriptionNotificationGoogleFunction func(ctx context.Context, subscription *api.ValidatedSubscription, providerPayload string) error
+	RuntimePurchaseNotificationAppleFunction      func(ctx context.Context, notificationType runtime.NotificationType, purchase *api.ValidatedPurchase, providerPayload *runtime.AppleNotificationData) error
+	RuntimeSubscriptionNotificationAppleFunction  func(ctx context.Context, notificationType runtime.NotificationType, subscription *api.ValidatedSubscription, providerPayload *runtime.AppleNotificationData) error
+	RuntimePurchaseNotificationGoogleFunction     func(ctx context.Context, notificationType runtime.NotificationType, purchase *api.ValidatedPurchase, providerPayload *runtime.PurchaseV2GoogleResponse) error
+	RuntimeSubscriptionNotificationGoogleFunction func(ctx context.Context, notificationType runtime.NotificationType, subscription *api.ValidatedSubscription, providerPayload *runtime.SubscriptionV2GoogleResponse) error
+
+	RuntimeStorageIndexFilterFunction func(ctx context.Context, write *StorageOpWrite) (bool, error)
 
 	RuntimeEventFunction func(ctx context.Context, logger runtime.Logger, evt *api.Event)
 
 	RuntimeEventCustomFunction       func(ctx context.Context, evt *api.Event)
-	RuntimeEventSessionStartFunction func(userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, evtTimeSec int64)
-	RuntimeEventSessionEndFunction   func(userID, username string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, evtTimeSec int64, reason string)
+	RuntimeEventSessionStartFunction func(ctx context.Context, userID, username string, headers map[string][]string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, evtTimeSec int64)
+	RuntimeEventSessionEndFunction   func(ctx context.Context, userID, username string, headers map[string][]string, vars map[string]string, expiry int64, sessionID, clientIP, clientPort, lang string, evtTimeSec int64, reason string)
+	RuntimeShutdownFunction          func(ctx context.Context)
 )
+
+type RuntimeHttpHandler struct {
+	PathPattern string
+	Handler     func(http.ResponseWriter, *http.Request)
+	Methods     []string
+}
 
 type RuntimeExecutionMode int
 
@@ -242,6 +272,7 @@ const (
 	RuntimeExecutionModeMatch
 	RuntimeExecutionModeMatchmaker
 	RuntimeExecutionModeMatchmakerOverride
+	RuntimeExecutionModeMatchmakerProcessor
 	RuntimeExecutionModeMatchCreate
 	RuntimeExecutionModeTournamentEnd
 	RuntimeExecutionModeTournamentReset
@@ -250,6 +281,9 @@ const (
 	RuntimeExecutionModeSubscriptionNotificationApple
 	RuntimeExecutionModePurchaseNotificationGoogle
 	RuntimeExecutionModeSubscriptionNotificationGoogle
+	RuntimeExecutionModeStorageIndexFilter
+	RuntimeExecutionModeShutdown
+	RuntimeExecutionModeAuthenticateProvider
 )
 
 func (e RuntimeExecutionMode) String() string {
@@ -270,6 +304,8 @@ func (e RuntimeExecutionMode) String() string {
 		return "matchmaker"
 	case RuntimeExecutionModeMatchmakerOverride:
 		return "matchmaker_override"
+	case RuntimeExecutionModeMatchmakerProcessor:
+		return "matchmaker_processor"
 	case RuntimeExecutionModeMatchCreate:
 		return "match_create"
 	case RuntimeExecutionModeTournamentEnd:
@@ -286,20 +322,26 @@ func (e RuntimeExecutionMode) String() string {
 		return "purchase_notification_google"
 	case RuntimeExecutionModeSubscriptionNotificationGoogle:
 		return "subscription_notification_google"
+	case RuntimeExecutionModeStorageIndexFilter:
+		return "storage_index_filter"
+	case RuntimeExecutionModeShutdown:
+		return "shutdown"
+	case RuntimeExecutionModeAuthenticateProvider:
+		return "authenticate_provider"
 	}
 
 	return ""
 }
 
 type RuntimeMatchCore interface {
-	MatchInit(presenceList *MatchPresenceList, deferMessageFn RuntimeMatchDeferMessageFunction, params map[string]interface{}) (interface{}, int, error)
-	MatchJoinAttempt(tick int64, state interface{}, userID, sessionID uuid.UUID, username string, sessionExpiry int64, vars map[string]string, clientIP, clientPort, node string, metadata map[string]string) (interface{}, bool, string, error)
-	MatchJoin(tick int64, state interface{}, joins []*MatchPresence) (interface{}, error)
-	MatchLeave(tick int64, state interface{}, leaves []*MatchPresence) (interface{}, error)
-	MatchLoop(tick int64, state interface{}, inputCh <-chan *MatchDataMessage) (interface{}, error)
-	MatchTerminate(tick int64, state interface{}, graceSeconds int) (interface{}, error)
-	MatchSignal(tick int64, state interface{}, data string) (interface{}, string, error)
-	GetState(state interface{}) (string, error)
+	MatchInit(presenceList *MatchPresenceList, deferMessageFn RuntimeMatchDeferMessageFunction, params map[string]any) (any, int, error)
+	MatchJoinAttempt(tick int64, state any, userID, sessionID uuid.UUID, username string, sessionExpiry int64, vars map[string]string, clientIP, clientPort, node string, metadata map[string]string) (any, bool, string, error)
+	MatchJoin(tick int64, state any, joins []*MatchPresence) (any, error)
+	MatchLeave(tick int64, state any, leaves []*MatchPresence) (any, error)
+	MatchLoop(tick int64, state any, inputCh <-chan *MatchDataMessage) (any, error)
+	MatchTerminate(tick int64, state any, graceSeconds int) (any, error)
+	MatchSignal(tick int64, state any, data string) (any, string, error)
+	GetState(state any) (string, error)
 	Label() string
 	TickRate() int
 	HandlerName() string
@@ -320,12 +362,15 @@ type moduleInfo struct {
 }
 
 type RuntimeInfo struct {
-	GoRpcFunctions         []string
-	LuaRpcFunctions        []string
-	JavaScriptRpcFunctions []string
-	GoModules              []*moduleInfo
-	LuaModules             []*moduleInfo
-	JavaScriptModules      []*moduleInfo
+	GoRpcFunctions                  []string
+	LuaRpcFunctions                 []string
+	JavaScriptRpcFunctions          []string
+	GoModules                       []*moduleInfo
+	LuaModules                      []*moduleInfo
+	JavaScriptModules               []*moduleInfo
+	GoAuthenticateProviders         []string
+	LuaAuthenticateProviders        []string
+	JavaScriptAuthenticateProviders []string
 }
 
 type RuntimeBeforeReqFunctions struct {
@@ -342,9 +387,11 @@ type RuntimeBeforeReqFunctions struct {
 	beforeAuthenticateFacebookInstantGameFunction   RuntimeBeforeAuthenticateFacebookInstantGameFunction
 	beforeAuthenticateGameCenterFunction            RuntimeBeforeAuthenticateGameCenterFunction
 	beforeAuthenticateGoogleFunction                RuntimeBeforeAuthenticateGoogleFunction
+	beforeAuthenticateFunction                      RuntimeBeforeAuthenticateFunction
 	beforeAuthenticateSteamFunction                 RuntimeBeforeAuthenticateSteamFunction
 	beforeListChannelMessagesFunction               RuntimeBeforeListChannelMessagesFunction
 	beforeListFriendsFunction                       RuntimeBeforeListFriendsFunction
+	beforeListFriendsOfFriendsFunction              RuntimeBeforeListFriendsOfFriendsFunction
 	beforeAddFriendsFunction                        RuntimeBeforeAddFriendsFunction
 	beforeDeleteFriendsFunction                     RuntimeBeforeDeleteFriendsFunction
 	beforeBlockFriendsFunction                      RuntimeBeforeBlockFriendsFunction
@@ -368,6 +415,7 @@ type RuntimeBeforeReqFunctions struct {
 	beforeListLeaderboardRecordsFunction            RuntimeBeforeListLeaderboardRecordsFunction
 	beforeWriteLeaderboardRecordFunction            RuntimeBeforeWriteLeaderboardRecordFunction
 	beforeListLeaderboardRecordsAroundOwnerFunction RuntimeBeforeListLeaderboardRecordsAroundOwnerFunction
+	beforeLinkFunction                              RuntimeBeforeLinkFunction
 	beforeLinkAppleFunction                         RuntimeBeforeLinkAppleFunction
 	beforeLinkCustomFunction                        RuntimeBeforeLinkCustomFunction
 	beforeLinkDeviceFunction                        RuntimeBeforeLinkDeviceFunction
@@ -389,6 +437,7 @@ type RuntimeBeforeReqFunctions struct {
 	beforeListTournamentsFunction                   RuntimeBeforeListTournamentsFunction
 	beforeWriteTournamentRecordFunction             RuntimeBeforeWriteTournamentRecordFunction
 	beforeListTournamentRecordsAroundOwnerFunction  RuntimeBeforeListTournamentRecordsAroundOwnerFunction
+	beforeUnlinkFunction                            RuntimeBeforeUnlinkFunction
 	beforeUnlinkAppleFunction                       RuntimeBeforeUnlinkAppleFunction
 	beforeUnlinkCustomFunction                      RuntimeBeforeUnlinkCustomFunction
 	beforeUnlinkDeviceFunction                      RuntimeBeforeUnlinkDeviceFunction
@@ -405,8 +454,12 @@ type RuntimeBeforeReqFunctions struct {
 	beforeValidatePurchaseGoogleFunction            RuntimeBeforeValidatePurchaseGoogleFunction
 	beforeValidateSubscriptionGoogleFunction        RuntimeBeforeValidateSubscriptionGoogleFunction
 	beforeValidatePurchaseHuaweiFunction            RuntimeBeforeValidatePurchaseHuaweiFunction
+	beforeValidatePurchaseFacebookInstantFunction   RuntimeBeforeValidatePurchaseFacebookInstantFunction
+	beforeValidatePurchaseSamsungFunction           RuntimeBeforeValidatePurchaseSamsungFunction
 	beforeListSubscriptionsFunction                 RuntimeBeforeListSubscriptionsFunction
 	beforeGetSubscriptionFunction                   RuntimeBeforeGetSubscriptionFunction
+	beforeGetMatchmakerStatsFunction                RuntimeBeforeGetMatchmakerStatsFunction
+	beforeListPartiesFunction                       RuntimeBeforeListPartiesFunction
 }
 
 type RuntimeAfterReqFunctions struct {
@@ -423,9 +476,11 @@ type RuntimeAfterReqFunctions struct {
 	afterAuthenticateFacebookInstantGameFunction   RuntimeAfterAuthenticateFacebookInstantGameFunction
 	afterAuthenticateGameCenterFunction            RuntimeAfterAuthenticateGameCenterFunction
 	afterAuthenticateGoogleFunction                RuntimeAfterAuthenticateGoogleFunction
+	afterAuthenticateFunction                      RuntimeAfterAuthenticateFunction
 	afterAuthenticateSteamFunction                 RuntimeAfterAuthenticateSteamFunction
 	afterListChannelMessagesFunction               RuntimeAfterListChannelMessagesFunction
 	afterListFriendsFunction                       RuntimeAfterListFriendsFunction
+	afterListFriendsOfFriendsFunction              RuntimeAfterListFriendsOfFriendsFunction
 	afterAddFriendsFunction                        RuntimeAfterAddFriendsFunction
 	afterDeleteFriendsFunction                     RuntimeAfterDeleteFriendsFunction
 	afterBlockFriendsFunction                      RuntimeAfterBlockFriendsFunction
@@ -451,6 +506,7 @@ type RuntimeAfterReqFunctions struct {
 	afterListLeaderboardRecordsAroundOwnerFunction RuntimeAfterListLeaderboardRecordsAroundOwnerFunction
 	afterLinkAppleFunction                         RuntimeAfterLinkAppleFunction
 	afterLinkCustomFunction                        RuntimeAfterLinkCustomFunction
+	afterLinkFunction                              RuntimeAfterLinkFunction
 	afterLinkDeviceFunction                        RuntimeAfterLinkDeviceFunction
 	afterLinkEmailFunction                         RuntimeAfterLinkEmailFunction
 	afterLinkFacebookFunction                      RuntimeAfterLinkFacebookFunction
@@ -472,6 +528,7 @@ type RuntimeAfterReqFunctions struct {
 	afterListTournamentRecordsAroundOwnerFunction  RuntimeAfterListTournamentRecordsAroundOwnerFunction
 	afterUnlinkAppleFunction                       RuntimeAfterUnlinkAppleFunction
 	afterUnlinkCustomFunction                      RuntimeAfterUnlinkCustomFunction
+	afterUnlinkFunction                            RuntimeAfterUnlinkFunction
 	afterUnlinkDeviceFunction                      RuntimeAfterUnlinkDeviceFunction
 	afterUnlinkEmailFunction                       RuntimeAfterUnlinkEmailFunction
 	afterUnlinkFacebookFunction                    RuntimeAfterUnlinkFacebookFunction
@@ -486,8 +543,12 @@ type RuntimeAfterReqFunctions struct {
 	afterValidatePurchaseGoogleFunction            RuntimeAfterValidatePurchaseGoogleFunction
 	afterValidateSubscriptionGoogleFunction        RuntimeAfterValidateSubscriptionGoogleFunction
 	afterValidatePurchaseHuaweiFunction            RuntimeAfterValidatePurchaseHuaweiFunction
+	afterValidatePurchaseFacebookInstantFunction   RuntimeAfterValidatePurchaseFacebookInstantFunction
+	afterValidatePurchaseSamsungFunction           RuntimeAfterValidatePurchaseSamsungFunction
 	afterListSubscriptionsFunction                 RuntimeAfterListSubscriptionsFunction
 	afterGetSubscriptionFunction                   RuntimeAfterGetSubscriptionFunction
+	afterGetMatchmakerStatsFunction                RuntimeAfterGetMatchmakerStatsFunction
+	afterListPartiesFunction                       RuntimeAfterListPartiesFunction
 }
 
 type Runtime struct {
@@ -495,14 +556,17 @@ type Runtime struct {
 
 	rpcFunctions map[string]RuntimeRpcFunction
 
+	authProviderRegistry *RuntimeAuthenticateProviderRegistry
+
 	beforeRtFunctions map[string]RuntimeBeforeRtFunction
 	afterRtFunctions  map[string]RuntimeAfterRtFunction
 
 	beforeReqFunctions *RuntimeBeforeReqFunctions
 	afterReqFunctions  *RuntimeAfterReqFunctions
 
-	matchmakerMatchedFunction  RuntimeMatchmakerMatchedFunction
-	matchmakerOverrideFunction RuntimeMatchmakerOverrideFunction
+	matchmakerMatchedFunction   RuntimeMatchmakerMatchedFunction
+	matchmakerProcessorFunction RuntimeMatchmakerProcessorFunction
+	matchmakerOverrideFunction  RuntimeMatchmakerOverrideFunction
 
 	tournamentEndFunction                  RuntimeTournamentEndFunction
 	tournamentResetFunction                RuntimeTournamentResetFunction
@@ -511,11 +575,18 @@ type Runtime struct {
 	purchaseNotificationGoogleFunction     RuntimePurchaseNotificationGoogleFunction
 	subscriptionNotificationGoogleFunction RuntimeSubscriptionNotificationGoogleFunction
 
+	storageIndexFilterFunctions map[string]RuntimeStorageIndexFilterFunction
+
+	httpHandlers        []*RuntimeHttpHandler
+	consoleHttpHandlers []*RuntimeHttpHandler
+
 	leaderboardResetFunction RuntimeLeaderboardResetFunction
 
 	eventFunctions *RuntimeEventFunctions
 
-	consoleInfo *RuntimeInfo
+	shutdownFunction RuntimeShutdownFunction
+
+	fleetManagers map[string]runtime.FleetManager
 }
 
 type MatchNamesListFunction func() []string
@@ -528,12 +599,12 @@ type MatchProvider struct {
 
 func (mp *MatchProvider) RegisterCreateFn(name string, fn RuntimeMatchCreateFunction) {
 	mp.Lock()
-	newProviders := make([]RuntimeMatchCreateFunction, len(mp.providers)+1, len(mp.providers)+1)
+	newProviders := make([]RuntimeMatchCreateFunction, len(mp.providers)+1)
 	copy(newProviders, mp.providers)
 	newProviders[len(mp.providers)] = fn
 	mp.providers = newProviders
 
-	newProviderNames := make([]string, len(mp.providerNames)+1, len(mp.providerNames)+1)
+	newProviderNames := make([]string, len(mp.providerNames)+1)
 	copy(newProviderNames, mp.providerNames)
 	newProviderNames[len(mp.providerNames)] = name
 	mp.providerNames = newProviderNames
@@ -616,7 +687,7 @@ func CheckRuntime(logger *zap.Logger, config Config, version string) error {
 	return nil
 }
 
-func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter) (*Runtime, *RuntimeInfo, error) {
+func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, partyRegistry PartyRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, storageIndex StorageIndex, fmCallbackHandler runtime.FmCallbackHandler) (*Runtime, *RuntimeInfo, error) {
 	runtimeConfig := config.GetRuntime()
 	startupLogger.Info("Initialising runtime", zap.String("path", runtimeConfig.Path))
 
@@ -631,34 +702,95 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 
 	matchProvider := NewMatchProvider()
 
-	goModules, goRPCFns, goBeforeRtFns, goAfterRtFns, goBeforeReqFns, goAfterReqFns, goMatchmakerMatchedFn, goMatchmakerCustomMatchingFn, goTournamentEndFn, goTournamentResetFn, goLeaderboardResetFn, goPurchaseNotificationAppleFn, goSubscriptionNotificationAppleFn, goPurchaseNotificationGoogleFn, goSubscriptionNotificationGoogleFn, allEventFns, goMatchNamesListFn, err := NewRuntimeProviderGo(ctx, logger, startupLogger, db, protojsonMarshaler, config, version, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, tracker, metrics, streamManager, router, runtimeConfig.Path, paths, eventQueue, matchProvider)
+	authProviderRegistry := &RuntimeAuthenticateProviderRegistry{providers: MapOf[string, *RuntimeAuthenticateProviderFunctions]{}}
+
+	satoriClient := satori.NewSatoriClient(
+		ctx,
+		logger,
+		config.GetSatori().Url,
+		config.GetSatori().ApiKeyName,
+		config.GetSatori().ApiKey,
+		config.GetSatori().ServerKey,
+		config.GetSatori().SigningKey,
+		config.GetSession().TokenExpirySec,
+		int64(config.GetSatori().HttpTimeoutMs),
+		int64(config.GetSatori().CacheTTLSec),
+		!config.GetSatori().CacheDisabled,
+		config.GetSatori().CacheMode,
+		config.GetSatori().RetryCount,
+	)
+
+	goModules,
+		goRPCFns,
+		goBeforeRtFns,
+		goAfterRtFns,
+		goBeforeReqFns,
+		goAfterReqFns,
+		goMatchmakerMatchedFn,
+		goMatchmakerCustomMatchingFn,
+		goMatchmakerProcessorFn,
+		goTournamentEndFn,
+		goTournamentResetFn,
+		goLeaderboardResetFn,
+		goShutdownFn,
+		goPurchaseNotificationAppleFn,
+		goSubscriptionNotificationAppleFn,
+		goPurchaseNotificationGoogleFn,
+		goSubscriptionNotificationGoogleFn,
+		goIndexFilterFns,
+		fleetManagers,
+		httpHandlers,
+		consoleHttpHandlers,
+		allEventFns,
+		goMatchNamesListFn, err := NewRuntimeProviderGo(ctx,
+		logger,
+		startupLogger,
+		db,
+		protojsonMarshaler,
+		config,
+		version,
+		socialClient,
+		leaderboardCache,
+		leaderboardRankCache,
+		leaderboardScheduler,
+		sessionRegistry,
+		sessionCache,
+		statusRegistry,
+		matchRegistry,
+		partyRegistry,
+		tracker,
+		metrics,
+		streamManager,
+		router,
+		storageIndex,
+		satoriClient,
+		runtimeConfig.Path,
+		paths,
+		eventQueue,
+		matchProvider,
+		fmCallbackHandler,
+		authProviderRegistry)
 	if err != nil {
 		startupLogger.Error("Error initialising Go runtime provider", zap.Error(err))
 		return nil, nil, err
 	}
 
-	luaModules, luaRPCFns, luaBeforeRtFns, luaAfterRtFns, luaBeforeReqFns, luaAfterReqFns, luaMatchmakerMatchedFn, luaTournamentEndFn, luaTournamentResetFn, luaLeaderboardResetFn, luaPurchaseNotificationAppleFn, luaSubscriptionNotificationAppleFn, luaPurchaseNotificationGoogleFn, luaSubscriptionNotificationGoogleFn, err := NewRuntimeProviderLua(logger, startupLogger, db, protojsonMarshaler, protojsonUnmarshaler, config, version, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, tracker, metrics, streamManager, router, allEventFns.eventFunction, runtimeConfig.Path, paths, matchProvider)
+	luaModules, luaRPCFns, luaBeforeRtFns, luaAfterRtFns, luaBeforeReqFns, luaAfterReqFns, luaMatchmakerMatchedFn, luaTournamentEndFn, luaTournamentResetFn, luaLeaderboardResetFn, luaShutdownFn, luaPurchaseNotificationAppleFn, luaSubscriptionNotificationAppleFn, luaPurchaseNotificationGoogleFn, luaSubscriptionNotificationGoogleFn, luaIndexFilterFns, luaAuthProviderIDs, err := NewRuntimeProviderLua(ctx, logger, startupLogger, db, protojsonMarshaler, protojsonUnmarshaler, config, version, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, partyRegistry, tracker, metrics, streamManager, router, satoriClient, allEventFns.eventFunction, runtimeConfig.Path, paths, matchProvider, storageIndex, authProviderRegistry)
 	if err != nil {
 		startupLogger.Error("Error initialising Lua runtime provider", zap.Error(err))
 		return nil, nil, err
 	}
 
-	jsModules, jsRPCFns, jsBeforeRtFns, jsAfterRtFns, jsBeforeReqFns, jsAfterReqFns, jsMatchmakerMatchedFn, jsTournamentEndFn, jsTournamentResetFn, jsLeaderboardResetFn, jsPurchaseNotificationAppleFn, jsSubscriptionNotificationAppleFn, jsPurchaseNotificationGoogleFn, jsSubscriptionNotificationGoogleFn, err := NewRuntimeProviderJS(logger, startupLogger, db, protojsonMarshaler, protojsonUnmarshaler, config, version, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, tracker, metrics, streamManager, router, allEventFns.eventFunction, runtimeConfig.Path, runtimeConfig.JsEntrypoint, matchProvider)
+	jsModules, jsRPCFns, jsBeforeRtFns, jsAfterRtFns, jsBeforeReqFns, jsAfterReqFns, jsMatchmakerMatchedFn, jsTournamentEndFn, jsTournamentResetFn, jsLeaderboardResetFn, jsShutdownFn, jsPurchaseNotificationAppleFn, jsSubscriptionNotificationAppleFn, jsPurchaseNotificationGoogleFn, jsSubscriptionNotificationGoogleFn, jsIndexFilterFns, jsAuthProviderIDs, err := NewRuntimeProviderJS(ctx, logger, startupLogger, db, protojsonMarshaler, protojsonUnmarshaler, config, version, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, partyRegistry, tracker, metrics, streamManager, router, satoriClient, allEventFns.eventFunction, runtimeConfig.Path, runtimeConfig.JsEntrypoint, matchProvider, storageIndex, authProviderRegistry)
 	if err != nil {
 		startupLogger.Error("Error initialising JavaScript runtime provider", zap.Error(err))
 		return nil, nil, err
 	}
 
 	allModules := make([]string, 0, len(jsModules)+len(luaModules)+len(goModules))
-	for _, module := range jsModules {
-		allModules = append(allModules, module)
-	}
-	for _, module := range luaModules {
-		allModules = append(allModules, module)
-	}
-	for _, module := range goModules {
-		allModules = append(allModules, module)
-	}
+	allModules = append(allModules, jsModules...)
+	allModules = append(allModules, luaModules...)
+	allModules = append(allModules, goModules...)
 
 	startupLogger.Info("Found runtime modules", zap.Int("count", len(allModules)), zap.Strings("modules", allModules))
 
@@ -694,6 +826,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		startupLogger.Info("Registered Go runtime RPC function invocation", zap.String("id", id))
 	}
 
+	for id := range fleetManagers {
+		startupLogger.Info("Registered Fleet Manager", zap.String("id", id))
+	}
+
 	allBeforeRtFunctions := make(map[string]RuntimeBeforeRtFunction, len(jsBeforeRtFns)+len(luaBeforeRtFns)+len(goBeforeRtFns))
 	for id, fn := range jsBeforeRtFns {
 		allBeforeRtFunctions[id] = fn
@@ -726,6 +862,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	// Register JavaScript Before Req functions
 	if allBeforeReqFunctions.beforeGetAccountFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "getaccount"))
+	}
+	if allBeforeReqFunctions.beforeGetMatchmakerStatsFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "getmatchmakerstats"))
 	}
 	if allBeforeReqFunctions.beforeUpdateAccountFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "updateaccount"))
@@ -763,6 +902,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allBeforeReqFunctions.beforeAuthenticateGoogleFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "authenticategoogle"))
 	}
+	if allBeforeReqFunctions.beforeAuthenticateFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "authenticate"))
+	}
 	if allBeforeReqFunctions.beforeAuthenticateSteamFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "authenticatesteam"))
 	}
@@ -771,6 +913,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	}
 	if allBeforeReqFunctions.beforeListFriendsFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "listfriends"))
+	}
+	if allBeforeReqFunctions.beforeListFriendsOfFriendsFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "listfriendsoffriends"))
 	}
 	if allBeforeReqFunctions.beforeAddFriendsFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "addfriends"))
@@ -847,6 +992,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allBeforeReqFunctions.beforeLinkCustomFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "linkcustom"))
 	}
+	if allBeforeReqFunctions.beforeLinkFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "link"))
+	}
 	if allBeforeReqFunctions.beforeLinkDeviceFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "linkdevice"))
 	}
@@ -910,6 +1058,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allBeforeReqFunctions.beforeUnlinkCustomFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "unlinkcustom"))
 	}
+	if allBeforeReqFunctions.beforeUnlinkFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "unlink"))
+	}
 	if allBeforeReqFunctions.beforeUnlinkDeviceFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "unlinkdevice"))
 	}
@@ -943,6 +1094,12 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allBeforeReqFunctions.beforeValidatePurchaseHuaweiFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "validatepurchasehuawei"))
 	}
+	if allBeforeReqFunctions.beforeValidatePurchaseFacebookInstantFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "validatepurchasefacebookinstant"))
+	}
+	if allBeforeReqFunctions.beforeValidatePurchaseSamsungFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "validatepurchasesamsung"))
+	}
 	if allBeforeReqFunctions.beforeValidateSubscriptionAppleFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "validatesubscriptionapple"))
 	}
@@ -955,6 +1112,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allBeforeReqFunctions.beforeListSubscriptionsFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "listsubscriptions"))
 	}
+	if allBeforeReqFunctions.beforeListPartiesFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "listparties"))
+	}
 	if allBeforeReqFunctions.beforeEventFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before custom events function invocation")
 	}
@@ -963,6 +1123,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if luaBeforeReqFns.beforeGetAccountFunction != nil {
 		allBeforeReqFunctions.beforeGetAccountFunction = luaBeforeReqFns.beforeGetAccountFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "getaccount"))
+	}
+	if luaBeforeReqFns.beforeGetMatchmakerStatsFunction != nil {
+		allBeforeReqFunctions.beforeGetMatchmakerStatsFunction = luaBeforeReqFns.beforeGetMatchmakerStatsFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "getmatchmakerstats"))
 	}
 	if luaBeforeReqFns.beforeUpdateAccountFunction != nil {
 		allBeforeReqFunctions.beforeUpdateAccountFunction = luaBeforeReqFns.beforeUpdateAccountFunction
@@ -1012,6 +1176,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeAuthenticateGoogleFunction = luaBeforeReqFns.beforeAuthenticateGoogleFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "authenticategoogle"))
 	}
+	if luaBeforeReqFns.beforeAuthenticateFunction != nil {
+		allBeforeReqFunctions.beforeAuthenticateFunction = luaBeforeReqFns.beforeAuthenticateFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "authenticate"))
+	}
 	if luaBeforeReqFns.beforeAuthenticateSteamFunction != nil {
 		allBeforeReqFunctions.beforeAuthenticateSteamFunction = luaBeforeReqFns.beforeAuthenticateSteamFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "authenticatesteam"))
@@ -1023,6 +1191,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if luaBeforeReqFns.beforeListFriendsFunction != nil {
 		allBeforeReqFunctions.beforeListFriendsFunction = luaBeforeReqFns.beforeListFriendsFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "listfriends"))
+	}
+	if luaBeforeReqFns.beforeListFriendsOfFriendsFunction != nil {
+		allBeforeReqFunctions.beforeListFriendsOfFriendsFunction = luaBeforeReqFns.beforeListFriendsOfFriendsFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "listfriendsoffriends"))
 	}
 	if luaBeforeReqFns.beforeAddFriendsFunction != nil {
 		allBeforeReqFunctions.beforeAddFriendsFunction = luaBeforeReqFns.beforeAddFriendsFunction
@@ -1120,6 +1292,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeLinkCustomFunction = luaBeforeReqFns.beforeLinkCustomFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "linkcustom"))
 	}
+	if luaBeforeReqFns.beforeLinkFunction != nil {
+		allBeforeReqFunctions.beforeLinkFunction = luaBeforeReqFns.beforeLinkFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "link"))
+	}
 	if luaBeforeReqFns.beforeLinkDeviceFunction != nil {
 		allBeforeReqFunctions.beforeLinkDeviceFunction = luaBeforeReqFns.beforeLinkDeviceFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "linkdevice"))
@@ -1204,6 +1380,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeUnlinkCustomFunction = luaBeforeReqFns.beforeUnlinkCustomFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "unlinkcustom"))
 	}
+	if luaBeforeReqFns.beforeUnlinkFunction != nil {
+		allBeforeReqFunctions.beforeUnlinkFunction = luaBeforeReqFns.beforeUnlinkFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "unlink"))
+	}
 	if luaBeforeReqFns.beforeUnlinkDeviceFunction != nil {
 		allBeforeReqFunctions.beforeUnlinkDeviceFunction = luaBeforeReqFns.beforeUnlinkDeviceFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "unlinkdevice"))
@@ -1248,6 +1428,14 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeValidatePurchaseHuaweiFunction = luaBeforeReqFns.beforeValidatePurchaseHuaweiFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "validatepurchasehuawei"))
 	}
+	if luaBeforeReqFns.beforeValidatePurchaseFacebookInstantFunction != nil {
+		allBeforeReqFunctions.beforeValidatePurchaseFacebookInstantFunction = luaBeforeReqFns.beforeValidatePurchaseFacebookInstantFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "validatepurchasefacebookinstant"))
+	}
+	if luaBeforeReqFns.beforeValidatePurchaseSamsungFunction != nil {
+		allBeforeReqFunctions.beforeValidatePurchaseSamsungFunction = luaBeforeReqFns.beforeValidatePurchaseSamsungFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "validatepurchasesamsung"))
+	}
 	if luaBeforeReqFns.beforeValidateSubscriptionAppleFunction != nil {
 		allBeforeReqFunctions.beforeValidateSubscriptionAppleFunction = luaBeforeReqFns.beforeValidateSubscriptionAppleFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "validatesubscriptionapple"))
@@ -1264,6 +1452,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeListSubscriptionsFunction = luaBeforeReqFns.beforeListSubscriptionsFunction
 		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "listsubscriptions"))
 	}
+	if luaBeforeReqFns.beforeListPartiesFunction != nil {
+		allBeforeReqFunctions.beforeListPartiesFunction = luaBeforeReqFns.beforeListPartiesFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "listparties"))
+	}
 	if luaBeforeReqFns.beforeEventFunction != nil {
 		allBeforeReqFunctions.beforeEventFunction = luaBeforeReqFns.beforeEventFunction
 		startupLogger.Info("Registered Lua runtime Before custom events function invocation")
@@ -1273,6 +1465,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if goBeforeReqFns.beforeGetAccountFunction != nil {
 		allBeforeReqFunctions.beforeGetAccountFunction = goBeforeReqFns.beforeGetAccountFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "getaccount"))
+	}
+	if goBeforeReqFns.beforeGetMatchmakerStatsFunction != nil {
+		allBeforeReqFunctions.beforeGetMatchmakerStatsFunction = goBeforeReqFns.beforeGetMatchmakerStatsFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "getmatchmakerstats"))
 	}
 	if goBeforeReqFns.beforeUpdateAccountFunction != nil {
 		allBeforeReqFunctions.beforeUpdateAccountFunction = goBeforeReqFns.beforeUpdateAccountFunction
@@ -1321,6 +1517,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if goBeforeReqFns.beforeAuthenticateGoogleFunction != nil {
 		allBeforeReqFunctions.beforeAuthenticateGoogleFunction = goBeforeReqFns.beforeAuthenticateGoogleFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "authenticategoogle"))
+	}
+	if goBeforeReqFns.beforeAuthenticateFunction != nil {
+		allBeforeReqFunctions.beforeAuthenticateFunction = goBeforeReqFns.beforeAuthenticateFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "authenticate"))
 	}
 	if goBeforeReqFns.beforeAuthenticateSteamFunction != nil {
 		allBeforeReqFunctions.beforeAuthenticateSteamFunction = goBeforeReqFns.beforeAuthenticateSteamFunction
@@ -1434,6 +1634,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeLinkCustomFunction = goBeforeReqFns.beforeLinkCustomFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "linkcustom"))
 	}
+	if goBeforeReqFns.beforeLinkFunction != nil {
+		allBeforeReqFunctions.beforeLinkFunction = goBeforeReqFns.beforeLinkFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "link"))
+	}
 	if goBeforeReqFns.beforeLinkDeviceFunction != nil {
 		allBeforeReqFunctions.beforeLinkDeviceFunction = goBeforeReqFns.beforeLinkDeviceFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "linkdevice"))
@@ -1518,6 +1722,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeUnlinkCustomFunction = goBeforeReqFns.beforeUnlinkCustomFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "unlinkcustom"))
 	}
+	if goBeforeReqFns.beforeUnlinkFunction != nil {
+		allBeforeReqFunctions.beforeUnlinkFunction = goBeforeReqFns.beforeUnlinkFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "unlink"))
+	}
 	if goBeforeReqFns.beforeUnlinkDeviceFunction != nil {
 		allBeforeReqFunctions.beforeUnlinkDeviceFunction = goBeforeReqFns.beforeUnlinkDeviceFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "unlinkdevice"))
@@ -1562,6 +1770,14 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeValidatePurchaseHuaweiFunction = goBeforeReqFns.beforeValidatePurchaseHuaweiFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "validatepurchasehuawei"))
 	}
+	if goBeforeReqFns.beforeValidatePurchaseFacebookInstantFunction != nil {
+		allBeforeReqFunctions.beforeValidatePurchaseFacebookInstantFunction = goBeforeReqFns.beforeValidatePurchaseFacebookInstantFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "validatepurchasefacebookinstant"))
+	}
+	if goBeforeReqFns.beforeValidatePurchaseSamsungFunction != nil {
+		allBeforeReqFunctions.beforeValidatePurchaseSamsungFunction = goBeforeReqFns.beforeValidatePurchaseSamsungFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "validatepurchasesamsung"))
+	}
 	if goBeforeReqFns.beforeValidateSubscriptionAppleFunction != nil {
 		allBeforeReqFunctions.beforeValidateSubscriptionAppleFunction = goBeforeReqFns.beforeValidateSubscriptionAppleFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "validatesubscriptionapple"))
@@ -1578,6 +1794,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allBeforeReqFunctions.beforeListSubscriptionsFunction = goBeforeReqFns.beforeListSubscriptionsFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "listsubscriptions"))
 	}
+	if goBeforeReqFns.beforeListPartiesFunction != nil {
+		allBeforeReqFunctions.beforeListPartiesFunction = goBeforeReqFns.beforeListPartiesFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "listparties"))
+	}
 	if goBeforeReqFns.beforeEventFunction != nil {
 		allBeforeReqFunctions.beforeEventFunction = goBeforeReqFns.beforeEventFunction
 		startupLogger.Info("Registered Go runtime Before custom events function invocation")
@@ -1587,6 +1807,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	// Register JavaScript After req functions
 	if allAfterReqFunctions.afterGetAccountFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "getaccount"))
+	}
+	if allAfterReqFunctions.afterGetMatchmakerStatsFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "getmatchmakerstats"))
 	}
 	if allAfterReqFunctions.afterUpdateAccountFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "updateaccount"))
@@ -1623,6 +1846,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	}
 	if allAfterReqFunctions.afterAuthenticateGoogleFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "authenticategoogle"))
+	}
+	if allAfterReqFunctions.afterAuthenticateFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "authenticate"))
 	}
 	if allAfterReqFunctions.afterAuthenticateSteamFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "authenticatesteam"))
@@ -1708,6 +1934,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allAfterReqFunctions.afterLinkCustomFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "linkcustom"))
 	}
+	if allAfterReqFunctions.afterLinkFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "link"))
+	}
 	if allAfterReqFunctions.afterLinkDeviceFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "linkdevice"))
 	}
@@ -1771,6 +2000,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allAfterReqFunctions.afterUnlinkCustomFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "unlinkcustom"))
 	}
+	if allAfterReqFunctions.afterUnlinkFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "unlink"))
+	}
 	if allAfterReqFunctions.afterUnlinkDeviceFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "unlinkdevice"))
 	}
@@ -1804,6 +2036,12 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allAfterReqFunctions.afterValidatePurchaseHuaweiFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "validatepurchasehuawei"))
 	}
+	if allAfterReqFunctions.afterValidatePurchaseFacebookInstantFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "validatepurchasefacebookinstant"))
+	}
+	if allAfterReqFunctions.afterValidatePurchaseSamsungFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime After function invocation", zap.String("id", "validatepurchasesamsung"))
+	}
 	if allAfterReqFunctions.afterValidateSubscriptionAppleFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "validatesubscriptionapple"))
 	}
@@ -1816,6 +2054,9 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if allAfterReqFunctions.afterListSubscriptionsFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "listsubscriptions"))
 	}
+	if allAfterReqFunctions.afterListPartiesFunction != nil {
+		startupLogger.Info("Registered JavaScript runtime Before function invocation", zap.String("id", "listparties"))
+	}
 	if allAfterReqFunctions.afterEventFunction != nil {
 		startupLogger.Info("Registered JavaScript runtime After custom events function invocation")
 	}
@@ -1824,6 +2065,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if luaAfterReqFns.afterGetAccountFunction != nil {
 		allAfterReqFunctions.afterGetAccountFunction = luaAfterReqFns.afterGetAccountFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "getaccount"))
+	}
+	if luaAfterReqFns.afterGetMatchmakerStatsFunction != nil {
+		allAfterReqFunctions.afterGetMatchmakerStatsFunction = luaAfterReqFns.afterGetMatchmakerStatsFunction
+		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "getmatchmakerstats"))
 	}
 	if luaAfterReqFns.afterUpdateAccountFunction != nil {
 		allAfterReqFunctions.afterUpdateAccountFunction = luaAfterReqFns.afterUpdateAccountFunction
@@ -1872,6 +2117,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if luaAfterReqFns.afterAuthenticateGoogleFunction != nil {
 		allAfterReqFunctions.afterAuthenticateGoogleFunction = luaAfterReqFns.afterAuthenticateGoogleFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "authenticategoogle"))
+	}
+	if luaAfterReqFns.afterAuthenticateFunction != nil {
+		allAfterReqFunctions.afterAuthenticateFunction = luaAfterReqFns.afterAuthenticateFunction
+		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "authenticate"))
 	}
 	if luaAfterReqFns.afterAuthenticateSteamFunction != nil {
 		allAfterReqFunctions.afterAuthenticateSteamFunction = luaAfterReqFns.afterAuthenticateSteamFunction
@@ -1981,6 +2230,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterLinkCustomFunction = luaAfterReqFns.afterLinkCustomFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "linkcustom"))
 	}
+	if luaAfterReqFns.afterLinkFunction != nil {
+		allAfterReqFunctions.afterLinkFunction = luaAfterReqFns.afterLinkFunction
+		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "link"))
+	}
 	if luaAfterReqFns.afterLinkDeviceFunction != nil {
 		allAfterReqFunctions.afterLinkDeviceFunction = luaAfterReqFns.afterLinkDeviceFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "linkdevice"))
@@ -2065,6 +2318,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterUnlinkCustomFunction = luaAfterReqFns.afterUnlinkCustomFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "unlinkcustom"))
 	}
+	if luaAfterReqFns.afterUnlinkFunction != nil {
+		allAfterReqFunctions.afterUnlinkFunction = luaAfterReqFns.afterUnlinkFunction
+		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "unlink"))
+	}
 	if luaAfterReqFns.afterUnlinkDeviceFunction != nil {
 		allAfterReqFunctions.afterUnlinkDeviceFunction = luaAfterReqFns.afterUnlinkDeviceFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "unlinkdevice"))
@@ -2109,6 +2366,14 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterValidatePurchaseHuaweiFunction = luaAfterReqFns.afterValidatePurchaseHuaweiFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "validatepurchasehuawei"))
 	}
+	if luaAfterReqFns.afterValidatePurchaseFacebookInstantFunction != nil {
+		allAfterReqFunctions.afterValidatePurchaseFacebookInstantFunction = luaAfterReqFns.afterValidatePurchaseFacebookInstantFunction
+		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "validatepurchasefacebookinstant"))
+	}
+	if luaAfterReqFns.afterValidatePurchaseSamsungFunction != nil {
+		allAfterReqFunctions.afterValidatePurchaseSamsungFunction = luaAfterReqFns.afterValidatePurchaseSamsungFunction
+		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "validatepurchasesamsung"))
+	}
 	if luaAfterReqFns.afterValidateSubscriptionAppleFunction != nil {
 		allAfterReqFunctions.afterValidateSubscriptionAppleFunction = luaAfterReqFns.afterValidateSubscriptionAppleFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "validatesubscriptionapple"))
@@ -2124,6 +2389,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if luaAfterReqFns.afterListSubscriptionsFunction != nil {
 		allAfterReqFunctions.afterListSubscriptionsFunction = luaAfterReqFns.afterListSubscriptionsFunction
 		startupLogger.Info("Registered Lua runtime After function invocation", zap.String("id", "listsubscriptions"))
+	}
+	if luaAfterReqFns.afterListPartiesFunction != nil {
+		allAfterReqFunctions.afterListPartiesFunction = luaAfterReqFns.afterListPartiesFunction
+		startupLogger.Info("Registered Lua runtime Before function invocation", zap.String("id", "listparties"))
 	}
 	if luaAfterReqFns.afterEventFunction != nil {
 		allAfterReqFunctions.afterEventFunction = luaAfterReqFns.afterEventFunction
@@ -2183,6 +2452,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterAuthenticateGoogleFunction = goAfterReqFns.afterAuthenticateGoogleFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "authenticategoogle"))
 	}
+	if goAfterReqFns.afterAuthenticateFunction != nil {
+		allAfterReqFunctions.afterAuthenticateFunction = goAfterReqFns.afterAuthenticateFunction
+		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "authenticate"))
+	}
 	if goAfterReqFns.afterAuthenticateSteamFunction != nil {
 		allAfterReqFunctions.afterAuthenticateSteamFunction = goAfterReqFns.afterAuthenticateSteamFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "authenticatesteam"))
@@ -2194,6 +2467,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if goAfterReqFns.afterListFriendsFunction != nil {
 		allAfterReqFunctions.afterListFriendsFunction = goAfterReqFns.afterListFriendsFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "listfriends"))
+	}
+	if goAfterReqFns.afterListFriendsOfFriendsFunction != nil {
+		allAfterReqFunctions.afterListFriendsOfFriendsFunction = goAfterReqFns.afterListFriendsOfFriendsFunction
+		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "listfriendsoffriends"))
 	}
 	if goAfterReqFns.afterAddFriendsFunction != nil {
 		allAfterReqFunctions.afterAddFriendsFunction = goAfterReqFns.afterAddFriendsFunction
@@ -2295,6 +2572,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterLinkCustomFunction = goAfterReqFns.afterLinkCustomFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "linkcustom"))
 	}
+	if goAfterReqFns.afterLinkFunction != nil {
+		allAfterReqFunctions.afterLinkFunction = goAfterReqFns.afterLinkFunction
+		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "link"))
+	}
 	if goAfterReqFns.afterLinkDeviceFunction != nil {
 		allAfterReqFunctions.afterLinkDeviceFunction = goAfterReqFns.afterLinkDeviceFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "linkdevice"))
@@ -2379,6 +2660,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterUnlinkCustomFunction = goAfterReqFns.afterUnlinkCustomFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "unlinkcustom"))
 	}
+	if goAfterReqFns.afterUnlinkFunction != nil {
+		allAfterReqFunctions.afterUnlinkFunction = goAfterReqFns.afterUnlinkFunction
+		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "unlink"))
+	}
 	if goAfterReqFns.afterUnlinkDeviceFunction != nil {
 		allAfterReqFunctions.afterUnlinkDeviceFunction = goAfterReqFns.afterUnlinkDeviceFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "unlinkdevice"))
@@ -2423,6 +2708,14 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		allAfterReqFunctions.afterValidatePurchaseHuaweiFunction = goAfterReqFns.afterValidatePurchaseHuaweiFunction
 		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "validatepurchasehuawei"))
 	}
+	if goAfterReqFns.afterValidatePurchaseFacebookInstantFunction != nil {
+		allAfterReqFunctions.afterValidatePurchaseFacebookInstantFunction = goAfterReqFns.afterValidatePurchaseFacebookInstantFunction
+		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "validatepurchasefacebookinstant"))
+	}
+	if goAfterReqFns.afterValidatePurchaseSamsungFunction != nil {
+		allAfterReqFunctions.afterValidatePurchaseSamsungFunction = goAfterReqFns.afterValidatePurchaseSamsungFunction
+		startupLogger.Info("Registered Go runtime After function invocation", zap.String("id", "validatepurchasesamsung"))
+	}
 	if goAfterReqFns.afterValidateSubscriptionAppleFunction != nil {
 		allAfterReqFunctions.afterValidateSubscriptionAppleFunction = goAfterReqFns.afterValidateSubscriptionAppleFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "validatesubscriptionapple"))
@@ -2438,6 +2731,10 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 	if goAfterReqFns.afterListSubscriptionsFunction != nil {
 		allAfterReqFunctions.afterListSubscriptionsFunction = goAfterReqFns.afterListSubscriptionsFunction
 		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "listsubscriptions"))
+	}
+	if goAfterReqFns.afterListPartiesFunction != nil {
+		allAfterReqFunctions.afterListPartiesFunction = goAfterReqFns.afterListPartiesFunction
+		startupLogger.Info("Registered Go runtime Before function invocation", zap.String("id", "listparties"))
 	}
 	if goAfterReqFns.afterEventFunction != nil {
 		allAfterReqFunctions.afterEventFunction = goAfterReqFns.afterEventFunction
@@ -2459,10 +2756,16 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 
 	var allMatchmakerOverrideFunction RuntimeMatchmakerOverrideFunction
 	switch {
-	case goMatchmakerMatchedFn != nil:
+	case goMatchmakerCustomMatchingFn != nil:
 		allMatchmakerOverrideFunction = goMatchmakerCustomMatchingFn
 		startupLogger.Info("Registered Go runtime Matchmaker Override function invocation")
-		// TODO: Handle other runtimes.
+	}
+
+	var allMatchmakerProcessorFunction RuntimeMatchmakerProcessorFunction
+	switch {
+	case goMatchmakerProcessorFn != nil:
+		allMatchmakerProcessorFunction = goMatchmakerProcessorFn
+		startupLogger.Info("Registered Go runtime Matchmaker Processor function invocation")
 	}
 
 	var allTournamentEndFunction RuntimeTournamentEndFunction
@@ -2556,6 +2859,41 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		startupLogger.Info("Registered JavaScript runtime Subscription Notification Google function invocation")
 	}
 
+	var allShutdownFunction RuntimeShutdownFunction
+	switch {
+	case goShutdownFn != nil:
+		allShutdownFunction = goShutdownFn
+		startupLogger.Info("Registered Go runtime Shutdown function invocation")
+	case luaShutdownFn != nil:
+		allShutdownFunction = luaShutdownFn
+		startupLogger.Info("Registered Lua runtime Shutdown function invocation")
+	case jsShutdownFn != nil:
+		allShutdownFunction = jsShutdownFn
+		startupLogger.Info("Registered JavaScript runtime Shutdown function invocation")
+	}
+
+	allStorageIndexFilterFunctions := make(map[string]RuntimeStorageIndexFilterFunction, len(goIndexFilterFns)+len(luaIndexFilterFns)+len(jsIndexFilterFns))
+	jsIndexNames := make(map[string]bool, len(jsIndexFilterFns))
+	for id, fn := range jsIndexFilterFns {
+		allStorageIndexFilterFunctions[id] = fn
+		jsIndexNames[id] = true
+		startupLogger.Info("Registered JavaScript runtime storage index filter function invocation", zap.String("index_name", id))
+	}
+	luaIndexNames := make(map[string]bool, len(luaIndexFilterFns))
+	for id, fn := range luaIndexFilterFns {
+		allStorageIndexFilterFunctions[id] = fn
+		delete(jsIndexNames, id)
+		luaIndexNames[id] = true
+		startupLogger.Info("Registered Lua runtime storage index filter function invocation", zap.String("index_name", id))
+	}
+	goIndexNames := make(map[string]bool, len(goIndexFilterFns))
+	for id, fn := range goIndexFilterFns {
+		allStorageIndexFilterFunctions[id] = fn
+		delete(luaIndexNames, id)
+		goIndexNames[id] = true
+		startupLogger.Info("Registered Go runtime storage index filter function invocation", zap.String("index_name", id))
+	}
+
 	// Lua matches are not registered the same, list only Go ones.
 	goMatchNames := goMatchNamesListFn()
 	for _, name := range goMatchNames {
@@ -2568,15 +2906,52 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		return nil, nil, err
 	}
 
+	// Go providers are not announced by name at registration, so they are whatever the registry holds beyond the Lua and JavaScript ones.
+	jsAuthProviderNames := make(map[string]bool, len(jsAuthProviderIDs))
+	for _, name := range jsAuthProviderIDs {
+		jsAuthProviderNames[name] = true
+	}
+	luaAuthProviderNames := make(map[string]bool, len(luaAuthProviderIDs))
+	for _, name := range luaAuthProviderIDs {
+		luaAuthProviderNames[name] = true
+	}
+	authProviderRegistry.providers.Range(func(name string, _ *RuntimeAuthenticateProviderFunctions) bool {
+		switch {
+		case jsAuthProviderNames[name]:
+			rInfo.JavaScriptAuthenticateProviders = append(rInfo.JavaScriptAuthenticateProviders, name)
+		case luaAuthProviderNames[name]:
+			rInfo.LuaAuthenticateProviders = append(rInfo.LuaAuthenticateProviders, name)
+		default:
+			rInfo.GoAuthenticateProviders = append(rInfo.GoAuthenticateProviders, name)
+		}
+		return true
+	})
+
+	sort.Strings(rInfo.GoAuthenticateProviders)
+	sort.Strings(rInfo.LuaAuthenticateProviders)
+	sort.Strings(rInfo.JavaScriptAuthenticateProviders)
+
+	for _, name := range rInfo.JavaScriptAuthenticateProviders {
+		startupLogger.Info("Registered JavaScript runtime Authenticate Provider function invocation", zap.String("provider", name))
+	}
+	for _, name := range rInfo.LuaAuthenticateProviders {
+		startupLogger.Info("Registered Lua runtime Authenticate Provider function invocation", zap.String("provider", name))
+	}
+	for _, name := range rInfo.GoAuthenticateProviders {
+		startupLogger.Info("Registered Go runtime Authenticate Provider function invocation", zap.String("provider", name))
+	}
+
 	return &Runtime{
 		matchCreateFunction:                    matchProvider.CreateMatch,
 		rpcFunctions:                           allRPCFunctions,
+		authProviderRegistry:                   authProviderRegistry,
 		beforeRtFunctions:                      allBeforeRtFunctions,
 		afterRtFunctions:                       allAfterRtFunctions,
 		beforeReqFunctions:                     allBeforeReqFunctions,
 		afterReqFunctions:                      allAfterReqFunctions,
 		matchmakerMatchedFunction:              allMatchmakerMatchedFunction,
 		matchmakerOverrideFunction:             allMatchmakerOverrideFunction,
+		matchmakerProcessorFunction:            allMatchmakerProcessorFunction,
 		tournamentEndFunction:                  allTournamentEndFunction,
 		tournamentResetFunction:                allTournamentResetFunction,
 		leaderboardResetFunction:               allLeaderboardResetFunction,
@@ -2584,6 +2959,14 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 		subscriptionNotificationAppleFunction:  allSubscriptionNotificationAppleFunction,
 		purchaseNotificationGoogleFunction:     allPurchaseNotificationGoogleFunction,
 		subscriptionNotificationGoogleFunction: allSubscriptionNotificationGoogleFunction,
+		storageIndexFilterFunctions:            allStorageIndexFilterFunctions,
+
+		httpHandlers:        httpHandlers,
+		consoleHttpHandlers: consoleHttpHandlers,
+
+		shutdownFunction: allShutdownFunction,
+
+		fleetManagers: fleetManagers,
 
 		eventFunctions: allEventFns,
 	}, rInfo, nil
@@ -2591,15 +2974,15 @@ func NewRuntime(ctx context.Context, logger, startupLogger *zap.Logger, db *sql.
 
 func runtimeInfo(paths []string, jsRpcIDs, luaRpcIDs, goRpcIDs map[string]bool, jsModules, luaModules, goModules []string) (*RuntimeInfo, error) {
 	jsRpcs := make([]string, 0, len(jsRpcIDs))
-	for id, _ := range jsRpcIDs {
+	for id := range jsRpcIDs {
 		jsRpcs = append(jsRpcs, id)
 	}
 	luaRpcs := make([]string, 0, len(luaRpcIDs))
-	for id, _ := range luaRpcIDs {
+	for id := range luaRpcIDs {
 		luaRpcs = append(luaRpcs, id)
 	}
 	goRpcs := make([]string, 0, len(goRpcIDs))
-	for id, _ := range goRpcIDs {
+	for id := range goRpcIDs {
 		goRpcs = append(goRpcs, id)
 	}
 
@@ -2663,6 +3046,10 @@ func (r *Runtime) Rpc(id string) RuntimeRpcFunction {
 	return r.rpcFunctions[id]
 }
 
+func (r *Runtime) AuthenticateProviderRegistry() *RuntimeAuthenticateProviderRegistry {
+	return r.authProviderRegistry
+}
+
 func (r *Runtime) BeforeRt(id string) RuntimeBeforeRtFunction {
 	return r.beforeRtFunctions[id]
 }
@@ -2677,6 +3064,14 @@ func (r *Runtime) BeforeGetAccount() RuntimeBeforeGetAccountFunction {
 
 func (r *Runtime) AfterGetAccount() RuntimeAfterGetAccountFunction {
 	return r.afterReqFunctions.afterGetAccountFunction
+}
+
+func (r *Runtime) BeforeGetMatchmakerStats() RuntimeBeforeGetMatchmakerStatsFunction {
+	return r.beforeReqFunctions.beforeGetMatchmakerStatsFunction
+}
+
+func (r *Runtime) AfterGetMatchmakerStats() RuntimeAfterGetMatchmakerStatsFunction {
+	return r.afterReqFunctions.afterGetMatchmakerStatsFunction
 }
 
 func (r *Runtime) BeforeUpdateAccount() RuntimeBeforeUpdateAccountFunction {
@@ -2775,6 +3170,14 @@ func (r *Runtime) AfterAuthenticateGoogle() RuntimeAfterAuthenticateGoogleFuncti
 	return r.afterReqFunctions.afterAuthenticateGoogleFunction
 }
 
+func (r *Runtime) BeforeAuthenticate() RuntimeBeforeAuthenticateFunction {
+	return r.beforeReqFunctions.beforeAuthenticateFunction
+}
+
+func (r *Runtime) AfterAuthenticate() RuntimeAfterAuthenticateFunction {
+	return r.afterReqFunctions.afterAuthenticateFunction
+}
+
 func (r *Runtime) BeforeAuthenticateSteam() RuntimeBeforeAuthenticateSteamFunction {
 	return r.beforeReqFunctions.beforeAuthenticateSteamFunction
 }
@@ -2797,6 +3200,14 @@ func (r *Runtime) BeforeListFriends() RuntimeBeforeListFriendsFunction {
 
 func (r *Runtime) AfterListFriends() RuntimeAfterListFriendsFunction {
 	return r.afterReqFunctions.afterListFriendsFunction
+}
+
+func (r *Runtime) BeforeListFriendsOfFriends() RuntimeBeforeListFriendsOfFriendsFunction {
+	return r.beforeReqFunctions.beforeListFriendsOfFriendsFunction
+}
+
+func (r *Runtime) AfterListFriendsOfFriends() RuntimeAfterListFriendsOfFriendsFunction {
+	return r.afterReqFunctions.afterListFriendsOfFriendsFunction
 }
 
 func (r *Runtime) BeforeAddFriends() RuntimeBeforeAddFriendsFunction {
@@ -2995,8 +3406,16 @@ func (r *Runtime) BeforeLinkCustom() RuntimeBeforeLinkCustomFunction {
 	return r.beforeReqFunctions.beforeLinkCustomFunction
 }
 
+func (r *Runtime) BeforeLink() RuntimeBeforeLinkFunction {
+	return r.beforeReqFunctions.beforeLinkFunction
+}
+
 func (r *Runtime) AfterLinkCustom() RuntimeAfterLinkCustomFunction {
 	return r.afterReqFunctions.afterLinkCustomFunction
+}
+
+func (r *Runtime) AfterLink() RuntimeAfterLinkFunction {
+	return r.afterReqFunctions.afterLinkFunction
 }
 
 func (r *Runtime) BeforeLinkDevice() RuntimeBeforeLinkDeviceFunction {
@@ -3163,8 +3582,16 @@ func (r *Runtime) BeforeUnlinkCustom() RuntimeBeforeUnlinkCustomFunction {
 	return r.beforeReqFunctions.beforeUnlinkCustomFunction
 }
 
+func (r *Runtime) BeforeUnlink() RuntimeBeforeUnlinkFunction {
+	return r.beforeReqFunctions.beforeUnlinkFunction
+}
+
 func (r *Runtime) AfterUnlinkCustom() RuntimeAfterUnlinkCustomFunction {
 	return r.afterReqFunctions.afterUnlinkCustomFunction
+}
+
+func (r *Runtime) AfterUnlink() RuntimeAfterUnlinkFunction {
+	return r.afterReqFunctions.afterUnlinkFunction
 }
 
 func (r *Runtime) BeforeUnlinkDevice() RuntimeBeforeUnlinkDeviceFunction {
@@ -3287,6 +3714,30 @@ func (r *Runtime) AfterValidatePurchaseHuawei() RuntimeAfterValidatePurchaseHuaw
 	return r.afterReqFunctions.afterValidatePurchaseHuaweiFunction
 }
 
+func (r *Runtime) BeforeValidatePurchaseFacebookInstant() RuntimeBeforeValidatePurchaseFacebookInstantFunction {
+	return r.beforeReqFunctions.beforeValidatePurchaseFacebookInstantFunction
+}
+
+func (r *Runtime) AfterValidatePurchaseFacebookInstant() RuntimeAfterValidatePurchaseFacebookInstantFunction {
+	return r.afterReqFunctions.afterValidatePurchaseFacebookInstantFunction
+}
+
+func (r *Runtime) BeforeValidatePurchaseSamsung() RuntimeBeforeValidatePurchaseSamsungFunction {
+	return r.beforeReqFunctions.beforeValidatePurchaseSamsungFunction
+}
+
+func (r *Runtime) AfterValidatePurchaseSamsung() RuntimeAfterValidatePurchaseSamsungFunction {
+	return r.afterReqFunctions.afterValidatePurchaseSamsungFunction
+}
+
+func (r *Runtime) BeforeListParties() RuntimeBeforeListPartiesFunction {
+	return r.beforeReqFunctions.beforeListPartiesFunction
+}
+
+func (r *Runtime) AfterListParties() RuntimeAfterListPartiesFunction {
+	return r.afterReqFunctions.afterListPartiesFunction
+}
+
 func (r *Runtime) BeforeEvent() RuntimeBeforeEventFunction {
 	return r.beforeReqFunctions.beforeEventFunction
 }
@@ -3307,6 +3758,10 @@ func (r *Runtime) TournamentReset() RuntimeTournamentResetFunction {
 	return r.tournamentResetFunction
 }
 
+func (r *Runtime) Shutdown() RuntimeShutdownFunction {
+	return r.shutdownFunction
+}
+
 func (r *Runtime) PurchaseNotificationApple() RuntimePurchaseNotificationAppleFunction {
 	return r.purchaseNotificationAppleFunction
 }
@@ -3317,6 +3772,10 @@ func (r *Runtime) SubscriptionNotificationApple() RuntimeSubscriptionNotificatio
 
 func (r *Runtime) PurchaseNotificationGoogle() RuntimePurchaseNotificationGoogleFunction {
 	return r.purchaseNotificationGoogleFunction
+}
+
+func (r *Runtime) StorageIndexFilterFunction(indexName string) RuntimeStorageIndexFilterFunction {
+	return r.storageIndexFilterFunctions[indexName]
 }
 
 func (r *Runtime) SubscriptionNotificationGoogle() RuntimeSubscriptionNotificationGoogleFunction {
@@ -3337,4 +3796,15 @@ func (r *Runtime) EventSessionStart() RuntimeEventSessionStartFunction {
 
 func (r *Runtime) EventSessionEnd() RuntimeEventSessionEndFunction {
 	return r.eventFunctions.sessionEndFunction
+}
+
+func RuntimeLoggerWithTraceId(ctx context.Context, logger runtime.Logger) runtime.Logger {
+	traceId := ctx.Value(ctxTraceId{})
+	if traceId != nil {
+		if traceIdStr, ok := traceId.(string); ok && traceIdStr != "" {
+			return logger.WithField("trace_id", traceIdStr)
+		}
+	}
+
+	return logger
 }

@@ -109,11 +109,7 @@ func (m *Message) FQMN() string {
 // It prefixes the type name with the package alias if
 // its belonging package is not "currentPackage".
 func (m *Message) GoType(currentPackage string) string {
-	var components []string
-	components = append(components, m.Outers...)
-	components = append(components, m.GetName())
-
-	name := strings.Join(components, "_")
+	name := goTypeName(m.Outers, m.GetName())
 	if !m.ForcePrefixedName && m.File.GoPkg.Path == currentPackage {
 		return name
 	}
@@ -148,15 +144,21 @@ func (e *Enum) FQEN() string {
 // It prefixes the type name with the package alias if
 // its belonging package is not "currentPackage".
 func (e *Enum) GoType(currentPackage string) string {
-	var components []string
-	components = append(components, e.Outers...)
-	components = append(components, e.GetName())
-
-	name := strings.Join(components, "_")
+	name := goTypeName(e.Outers, e.GetName())
 	if !e.ForcePrefixedName && e.File.GoPkg.Path == currentPackage {
 		return name
 	}
 	return fmt.Sprintf("%s.%s", e.File.Pkg(), name)
+}
+
+func goTypeName(outers []string, name string) string {
+	components := make([]string, 0, len(outers)+1)
+	for _, outer := range outers {
+		components = append(components, casing.Camel(outer))
+	}
+
+	components = append(components, casing.Camel(name))
+	return strings.Join(components, "_")
 }
 
 // Service wraps descriptorpb.ServiceDescriptorProto for richer features.
@@ -323,14 +325,14 @@ type Body struct {
 
 // AssignableExpr returns an assignable expression in Go to be used to initialize method request object.
 // It starts with "msgExpr", which is the go expression of the method request object.
-func (b Body) AssignableExpr(msgExpr string) string {
-	return b.FieldPath.AssignableExpr(msgExpr)
+func (b Body) AssignableExpr(msgExpr string, currentPackage string) string {
+	return b.FieldPath.AssignableExpr(msgExpr, currentPackage)
 }
 
 // AssignableExprPrep returns preparatory statements for an assignable expression to initialize the
 // method request object.
-func (b Body) AssignableExprPrep(msgExpr string) string {
-	return b.FieldPath.AssignableExprPrep(msgExpr)
+func (b Body) AssignableExprPrep(msgExpr string, currentPackage string) string {
+	return b.FieldPath.AssignableExprPrep(msgExpr, currentPackage)
 }
 
 // FieldPath is a path to a field from a request message.
@@ -338,7 +340,7 @@ type FieldPath []FieldPathComponent
 
 // String returns a string representation of the field path.
 func (p FieldPath) String() string {
-	var components []string
+	components := make([]string, 0, len(p))
 	for _, c := range p {
 		components = append(components, c.Name)
 	}
@@ -365,7 +367,7 @@ func (p FieldPath) IsOptionalProto3() bool {
 // It starts with "msgExpr", which is the go expression of the method request object. Before using
 // such an expression the prep statements must be emitted first, in case the field path includes
 // a oneof. See FieldPath.AssignableExprPrep.
-func (p FieldPath) AssignableExpr(msgExpr string) string {
+func (p FieldPath) AssignableExpr(msgExpr string, currentPackage string) string {
 	l := len(p)
 	if l == 0 {
 		return msgExpr
@@ -380,10 +382,10 @@ func (p FieldPath) AssignableExpr(msgExpr string) string {
 			index := c.Target.OneofIndex
 			msg := c.Target.Message
 			oneOfName := casing.Camel(msg.GetOneofDecl()[*index].GetName())
-			oneofFieldName := msg.GetName() + "_" + c.AssignableExpr()
+			oneofFieldName := msg.GoType(currentPackage) + "_" + c.AssignableExpr()
 
 			if c.Target.ForcePrefixedName {
-				oneofFieldName = msg.File.Pkg() + "." + oneofFieldName
+				oneofFieldName = msg.File.Pkg() + "." + msg.GetName() + "_" + c.AssignableExpr()
 			}
 
 			components = components + "." + oneOfName + ".(*" + oneofFieldName + ")"
@@ -399,9 +401,9 @@ func (p FieldPath) AssignableExpr(msgExpr string) string {
 }
 
 // AssignableExprPrep returns preparation statements for an assignable expression to assign a value
-// to the target field. The Go expression of the method request object is "msgExpr". This is only
-// needed for field paths that contain oneofs. Otherwise, an empty string is returned.
-func (p FieldPath) AssignableExprPrep(msgExpr string) string {
+// to the target field. The Go expression of the method request object is "msgExpr". This is needed
+// for field paths that contain oneofs or intermediate message fields.
+func (p FieldPath) AssignableExprPrep(msgExpr string, currentPackage string) string {
 	l := len(p)
 	if l == 0 {
 		return ""
@@ -417,10 +419,10 @@ func (p FieldPath) AssignableExprPrep(msgExpr string) string {
 			index := c.Target.OneofIndex
 			msg := c.Target.Message
 			oneOfName := casing.Camel(msg.GetOneofDecl()[*index].GetName())
-			oneofFieldName := msg.GetName() + "_" + c.AssignableExpr()
+			oneofFieldName := msg.GoType(currentPackage) + "_" + c.AssignableExpr()
 
 			if c.Target.ForcePrefixedName {
-				oneofFieldName = msg.File.Pkg() + "." + oneofFieldName
+				oneofFieldName = msg.File.Pkg() + "." + msg.GetName() + "_" + c.AssignableExpr()
 			}
 
 			components = components + "." + oneOfName
@@ -438,10 +440,71 @@ func (p FieldPath) AssignableExprPrep(msgExpr string) string {
 			components = components + "." + c.AssignableExpr()
 			continue
 		}
+
+		if isSingularMessageField(c.Target) {
+			if msg := p.messageTypeForIntermediate(i); msg != nil {
+				fieldExpr := components + "." + c.AssignableExpr()
+				preparations = append(preparations, fmt.Sprintf(`if %s == nil {
+				%s = &%s{}
+			}`, fieldExpr, fieldExpr, msg.GoType(currentPackage)))
+			}
+		}
+
 		components = components + "." + c.ValueExpr()
 	}
 
 	return strings.Join(preparations, "\n")
+}
+
+func (p FieldPath) messageTypeForIntermediate(i int) *Message {
+	if msg := p[i].Target.FieldMessage; msg != nil {
+		return msg
+	}
+	if i+1 < len(p) {
+		return p[i+1].Target.Message
+	}
+	return nil
+}
+
+func isSingularMessageField(f *Field) bool {
+	if f.GetLabel() == descriptorpb.FieldDescriptorProto_LABEL_REPEATED {
+		return false
+	}
+	switch f.GetType() {
+	case descriptorpb.FieldDescriptorProto_TYPE_MESSAGE, descriptorpb.FieldDescriptorProto_TYPE_GROUP:
+		return true
+	default:
+		return false
+	}
+}
+
+// OpaqueSetterExpr returns the Go expression to invoke the generated setter for
+// the final component in the path while respecting nested getters required by
+// the opaque API.
+func (p FieldPath) OpaqueSetterExpr(msgExpr string) string {
+	if len(p) == 0 {
+		return msgExpr
+	}
+
+	return fmt.Sprintf("%s.Set%s", p.opaqueOwnerExpr(msgExpr), casing.Camel(p[len(p)-1].Name))
+}
+
+// opaqueOwnerExpr builds the Go expression for the message that owns the final
+// component in the path by chaining the generated getters.
+func (p FieldPath) opaqueOwnerExpr(msgExpr string) string {
+	if len(p) <= 1 {
+		return msgExpr
+	}
+
+	var sb strings.Builder
+	sb.WriteString(msgExpr)
+	for i := range len(p) - 1 {
+		sb.WriteString(".Get")
+		sb.WriteString(casing.Camel(p[i].Name))
+		sb.WriteString("()")
+	}
+
+	return sb.String()
 }
 
 // FieldPathComponent is a path component in FieldPath

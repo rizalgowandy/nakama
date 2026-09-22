@@ -18,25 +18,29 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
-	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/gofrs/uuid/v5"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/apigrpc"
+	"github.com/heroiclabs/nakama/v3/internal/ctxkeys"
 	"github.com/heroiclabs/nakama/v3/social"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -44,6 +48,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	_ "google.golang.org/grpc/encoding/gzip" // enable gzip compression on server for grpc
+	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -51,14 +56,19 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+var once sync.Once
+
 // Used as part of JSON input validation.
 const byteBracket byte = '{'
 
 // Keys used for storing/retrieving user information in the context of a request after authentication.
-type ctxUserIDKey struct{}
-type ctxUsernameKey struct{}
-type ctxVarsKey struct{}
-type ctxExpiryKey struct{}
+type ctxTraceId = ctxkeys.TraceIdKey
+type ctxUserIDKey = ctxkeys.UserIDKey
+type ctxUsernameKey = ctxkeys.UsernameKey
+type ctxVarsKey = ctxkeys.VarsKey
+type ctxExpiryKey = ctxkeys.ExpiryKey
+type ctxTokenIDKey = ctxkeys.TokenIDKey
+type ctxTokenIssuedAtKey = ctxkeys.TokenIssuedAtKey
 
 type ctxFullMethodKey struct{}
 
@@ -69,22 +79,25 @@ type ApiServer struct {
 	config               Config
 	version              string
 	socialClient         *social.Client
+	storageIndex         StorageIndex
 	leaderboardCache     LeaderboardCache
 	leaderboardRankCache LeaderboardRankCache
 	sessionCache         SessionCache
 	sessionRegistry      SessionRegistry
-	statusRegistry       *StatusRegistry
+	statusRegistry       StatusRegistry
 	matchRegistry        MatchRegistry
+	partyRegistry        PartyRegistry
 	tracker              Tracker
 	router               MessageRouter
 	streamManager        StreamManager
 	metrics              Metrics
+	matchmaker           Matchmaker
 	runtime              *Runtime
 	grpcServer           *grpc.Server
 	grpcGatewayServer    *http.Server
 }
 
-func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, pipeline *Pipeline, runtime *Runtime) *ApiServer {
+func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, storageIndex StorageIndex, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, partyRegistry PartyRegistry, matchmaker Matchmaker, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, pipeline *Pipeline, runtime *Runtime) *ApiServer {
 	var gatewayContextTimeoutMs string
 	if config.GetSocket().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
@@ -96,9 +109,10 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	}
 
 	serverOpts := []grpc.ServerOption{
-		grpc.StatsHandler(&MetricsGrpcHandler{MetricsFn: metrics.Api}),
+		grpc.StatsHandler(&MetricsGrpcHandler{MetricsFn: metrics.Api, Metrics: metrics}),
 		grpc.MaxRecvMsgSize(int(config.GetSocket().MaxRequestSizeBytes)),
-		grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			ctx = context.WithValue(ctx, ctxTraceId{}, uuid.Must(uuid.NewV4()).String())
 			ctx, err := securityInterceptorFunc(logger, config, sessionCache, ctx, req, info)
 			if err != nil {
 				return nil, err
@@ -111,6 +125,13 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	}
 	grpcServer := grpc.NewServer(serverOpts...)
 
+	// Set grpc logger
+	grpcLogger, err := NewGrpcCustomLogger(logger)
+	if err != nil {
+		startupLogger.Fatal("failed to set up grpc logger", zap.Error(err))
+	}
+	once.Do(func() { grpclog.SetLoggerV2(grpcLogger) })
+
 	s := &ApiServer{
 		logger:               logger,
 		db:                   db,
@@ -119,14 +140,17 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 		socialClient:         socialClient,
 		leaderboardCache:     leaderboardCache,
 		leaderboardRankCache: leaderboardRankCache,
+		storageIndex:         storageIndex,
 		sessionCache:         sessionCache,
 		sessionRegistry:      sessionRegistry,
 		statusRegistry:       statusRegistry,
 		matchRegistry:        matchRegistry,
+		partyRegistry:        partyRegistry,
 		tracker:              tracker,
 		router:               router,
 		streamManager:        streamManager,
 		metrics:              metrics,
+		matchmaker:           matchmaker,
 		runtime:              runtime,
 		grpcServer:           grpcServer,
 	}
@@ -149,9 +173,11 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	// Should start after GRPC server itself because RegisterNakamaHandlerFromEndpoint below tries to dial GRPC.
 	ctx := context.Background()
 	grpcGateway := grpcgw.NewServeMux(
+		grpcgw.WithErrorHandler(handleHTTPError),
+		grpcgw.WithRoutingErrorHandler(handleRoutingError),
 		grpcgw.WithMetadata(func(ctx context.Context, r *http.Request) metadata.MD {
 			// For RPC GET operations pass through any custom query parameters.
-			if r.Method != "GET" || !strings.HasPrefix(r.URL.Path, "/v2/rpc/") {
+			if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/v2/rpc/") {
 				return metadata.MD{}
 			}
 
@@ -164,17 +190,13 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 				}
 				p["q_"+k] = vs
 			}
-			return metadata.MD(p)
+			return p
 		}),
 		grpcgw.WithMarshalerOption(grpcgw.MIMEWildcard, &grpcgw.HTTPBodyMarshaler{
 			Marshaler: &grpcgw.JSONPb{
-				MarshalOptions: protojson.MarshalOptions{
-					UseProtoNames:  true,
-					UseEnumNumbers: true,
-				},
-				UnmarshalOptions: protojson.UnmarshalOptions{
-					DiscardUnknown: true,
-				},
+				UseProtoNames:  true,
+				UseEnumNumbers: true,
+				DiscardUnknown: true,
 			},
 		}),
 	)
@@ -209,12 +231,30 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 
 	grpcGatewayRouter := mux.NewRouter()
 	// Special case routes. Do NOT enable compression on WebSocket route, it results in "http: response.Write on hijacked connection" errors.
-	grpcGatewayRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }).Methods("GET")
-	grpcGatewayRouter.HandleFunc("/ws", NewSocketWsAcceptor(logger, config, sessionRegistry, sessionCache, statusRegistry, matchmaker, tracker, metrics, runtime, protojsonMarshaler, protojsonUnmarshaler, pipeline)).Methods("GET")
+	grpcGatewayRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }).Methods(http.MethodGet)
+	grpcGatewayRouter.HandleFunc("/ws", NewSocketWsAcceptor(logger, config, sessionRegistry, sessionCache, statusRegistry, matchmaker, tracker, metrics, runtime, protojsonMarshaler, protojsonUnmarshaler, pipeline)).Methods(http.MethodGet)
 
 	// Another nested router to hijack RPC requests bound for GRPC Gateway.
 	grpcGatewayMux := mux.NewRouter()
-	grpcGatewayMux.HandleFunc("/v2/rpc/{id:.*}", s.RpcFuncHttp).Methods("GET", "POST")
+	grpcGatewayMux.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxTraceId{}, uuid.Must(uuid.NewV4()).String())))
+		})
+	})
+	grpcGatewayMux.HandleFunc("/v2/rpc/{id:.*}", s.RpcFuncHttp).Methods(http.MethodGet, http.MethodPost)
+	for _, handler := range runtime.httpHandlers {
+		if handler == nil {
+			continue
+		}
+		if !strings.HasPrefix(handler.PathPattern, "/") {
+			logger.Fatal("Failed to register custom HTTP handler, path pattern must start with '/'", zap.String("path_pattern", handler.PathPattern))
+		}
+		route := grpcGatewayMux.HandleFunc(handler.PathPattern, handler.Handler)
+		if len(handler.Methods) > 0 {
+			route.Methods(handler.Methods...)
+		}
+		logger.Info("Registered custom HTTP handler", zap.String("path_pattern", handler.PathPattern))
+	}
 	grpcGatewayMux.NewRoute().Handler(grpcGateway)
 
 	// Enable stats recording on all request paths except:
@@ -230,7 +270,7 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	// Enable compression on responses sent by the gateway.
 	// Enable decompression on requests received by the gateway.
 	handlerWithDecompressRequest := decompressHandler(logger, grpcGatewayMux)
-	handlerWithCompressResponse := handlers.CompressHandler(handlerWithDecompressRequest)
+	handlerWithCompressResponse := compressHandler(handlerWithDecompressRequest)
 	maxMessageSizeBytes := config.GetSocket().MaxRequestSizeBytes
 	handlerWithMaxBody := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check max body size before decompressing incoming request body.
@@ -252,7 +292,7 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 	// Enable CORS on all requests.
 	CORSHeaders := handlers.AllowedHeaders([]string{"Authorization", "Content-Type", "User-Agent"})
 	CORSOrigins := handlers.AllowedOrigins([]string{"*"})
-	CORSMethods := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "DELETE"})
+	CORSMethods := handlers.AllowedMethods([]string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete})
 	handlerWithCORS := handlers.CORS(CORSHeaders, CORSOrigins, CORSMethods)(grpcGatewayRouter)
 
 	// Enable configured response headers, if any are set. Do not override values that may have been set by server processing.
@@ -292,11 +332,11 @@ func StartApiServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, p
 		}
 
 		if config.GetSocket().TLSCert != nil {
-			if err := s.grpcGatewayServer.ServeTLS(listener, "", ""); err != nil && err != http.ErrServerClosed {
+			if err := s.grpcGatewayServer.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				startupLogger.Fatal("API server gateway listener failed", zap.Error(err))
 			}
 		} else {
-			if err := s.grpcGatewayServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+			if err := s.grpcGatewayServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				startupLogger.Fatal("API server gateway listener failed", zap.Error(err))
 			}
 		}
@@ -318,12 +358,14 @@ func (s *ApiServer) Healthcheck(ctx context.Context, in *emptypb.Empty) (*emptyp
 	return &emptypb.Empty{}, nil
 }
 
-func securityInterceptorFunc(logger *zap.Logger, config Config, sessionCache SessionCache, ctx context.Context, req interface{}, info *grpc.UnaryServerInfo) (context.Context, error) {
+func securityInterceptorFunc(logger *zap.Logger, config Config, sessionCache SessionCache, ctx context.Context, req any, info *grpc.UnaryServerInfo) (context.Context, error) {
 	switch info.FullMethod {
 	case "/nakama.api.Nakama/Healthcheck":
 		// Healthcheck has no security.
 		return ctx, nil
 	case "/nakama.api.Nakama/SessionRefresh":
+		fallthrough
+	case "/nakama.api.Nakama/Authenticate":
 		fallthrough
 	case "/nakama.api.Nakama/AuthenticateApple":
 		fallthrough
@@ -401,15 +443,15 @@ func securityInterceptorFunc(logger *zap.Logger, config Config, sessionCache Ses
 			// Value of "authorization" or "grpc-authorization" was empty or repeated.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		userID, username, vars, exp, token, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
+		userID, username, vars, exp, tokenId, tokenIssuedAt, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
 		if !ok {
 			// Value of "authorization" or "grpc-authorization" was malformed or expired.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		if !sessionCache.IsValidSession(userID, exp, token) {
+		if !sessionCache.IsValidSession(userID, exp, tokenId) {
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		ctx = context.WithValue(context.WithValue(context.WithValue(context.WithValue(ctx, ctxUserIDKey{}, userID), ctxUsernameKey{}, username), ctxVarsKey{}, vars), ctxExpiryKey{}, exp)
+		ctx = populateCtx(ctx, userID, username, tokenId, vars, exp, tokenIssuedAt)
 	default:
 		// Unless explicitly defined above, handlers require full user authentication.
 		md, ok := metadata.FromIncomingContext(ctx)
@@ -429,17 +471,28 @@ func securityInterceptorFunc(logger *zap.Logger, config Config, sessionCache Ses
 			// Value of "authorization" or "grpc-authorization" was empty or repeated.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		userID, username, vars, exp, token, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
+		userID, username, vars, exp, tokenId, tokenIssuedAt, ok := parseBearerAuth([]byte(config.GetSession().EncryptionKey), auth[0])
 		if !ok {
 			// Value of "authorization" or "grpc-authorization" was malformed or expired.
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		if !sessionCache.IsValidSession(userID, exp, token) {
+		if !sessionCache.IsValidSession(userID, exp, tokenId) {
 			return nil, status.Error(codes.Unauthenticated, "Auth token invalid")
 		}
-		ctx = context.WithValue(context.WithValue(context.WithValue(context.WithValue(ctx, ctxUserIDKey{}, userID), ctxUsernameKey{}, username), ctxVarsKey{}, vars), ctxExpiryKey{}, exp)
+		ctx = populateCtx(ctx, userID, username, tokenId, vars, exp, tokenIssuedAt)
 	}
 	return context.WithValue(ctx, ctxFullMethodKey{}, info.FullMethod), nil
+}
+
+func populateCtx(ctx context.Context, userId uuid.UUID, username, tokenId string, vars map[string]string, tokenExpiry, tokenIssuedAt int64) context.Context {
+	ctx = context.WithValue(ctx, ctxUserIDKey{}, userId)
+	ctx = context.WithValue(ctx, ctxUsernameKey{}, username)
+	ctx = context.WithValue(ctx, ctxTokenIDKey{}, tokenId)
+	ctx = context.WithValue(ctx, ctxVarsKey{}, vars)
+	ctx = context.WithValue(ctx, ctxExpiryKey{}, tokenExpiry)
+	ctx = context.WithValue(ctx, ctxTokenIssuedAtKey{}, tokenIssuedAt)
+
+	return ctx
 }
 
 func parseBasicAuth(auth string) (username, password string, ok bool) {
@@ -455,14 +508,14 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 		return
 	}
 	cs := string(c)
-	s := strings.IndexByte(cs, ':')
-	if s < 0 {
+	before, after, ok := strings.Cut(cs, ":")
+	if !ok {
 		return
 	}
-	return cs[:s], cs[s+1:], true
+	return before, after, true
 }
 
-func parseBearerAuth(hmacSecretByte []byte, auth string) (userID uuid.UUID, username string, vars map[string]string, exp int64, token string, ok bool) {
+func parseBearerAuth(hmacSecretByte []byte, auth string) (userID uuid.UUID, username string, vars map[string]string, exp int64, tokenId string, issuedAt int64, ok bool) {
 	if auth == "" {
 		return
 	}
@@ -473,13 +526,10 @@ func parseBearerAuth(hmacSecretByte []byte, auth string) (userID uuid.UUID, user
 	return parseToken(hmacSecretByte, auth[len(prefix):])
 }
 
-func parseToken(hmacSecretByte []byte, tokenString string) (userID uuid.UUID, username string, vars map[string]string, exp int64, token string, ok bool) {
-	jwtToken, err := jwt.ParseWithClaims(tokenString, &SessionTokenClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if s, ok := token.Method.(*jwt.SigningMethodHMAC); !ok || s.Hash != crypto.SHA256 {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
+func parseToken(hmacSecretByte []byte, tokenString string) (userID uuid.UUID, username string, vars map[string]string, exp int64, tokenId string, issuedAt int64, ok bool) {
+	jwtToken, err := jwt.ParseWithClaims(tokenString, &SessionTokenClaims{}, func(token *jwt.Token) (any, error) {
 		return hmacSecretByte, nil
-	})
+	}, jwt.WithExpirationRequired(), jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
 		return
 	}
@@ -491,11 +541,111 @@ func parseToken(hmacSecretByte []byte, tokenString string) (userID uuid.UUID, us
 	if err != nil {
 		return
 	}
-	return userID, claims.Username, claims.Vars, claims.ExpiresAt, tokenString, true
+	return userID, claims.Username, claims.Vars, claims.ExpiresAt, claims.TokenId, claims.IssuedAt, true
+}
+
+func compressHandler(h http.Handler) http.Handler {
+	const (
+		gzipEncoding  = "gzip"
+		flateEncoding = "deflate"
+	)
+
+	gzipPool := &sync.Pool{
+		New: func() any {
+			w, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+			return w
+		},
+	}
+	flatePool := &sync.Pool{
+		New: func() any {
+			w, _ := flate.NewWriter(io.Discard, flate.DefaultCompression)
+			return w
+		},
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Accept-Encoding")
+
+		var encoding string
+		for enc := range strings.SplitSeq(r.Header.Get("Accept-Encoding"), ",") {
+			enc = strings.TrimSpace(enc)
+			if enc == gzipEncoding || enc == flateEncoding {
+				encoding = enc
+				break
+			}
+		}
+		if encoding == "" || r.Header.Get("Upgrade") != "" {
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		var encWriter compressEncoder
+		if encoding == gzipEncoding {
+			gz := gzipPool.Get().(*gzip.Writer)
+			gz.Reset(w)
+			defer func() {
+				gz.Close()
+				gz.Reset(io.Discard)
+				gzipPool.Put(gz)
+			}()
+			encWriter = gz
+		} else {
+			fl := flatePool.Get().(*flate.Writer)
+			fl.Reset(w)
+			defer func() {
+				fl.Close()
+				fl.Reset(io.Discard)
+				flatePool.Put(fl)
+			}()
+			encWriter = fl
+		}
+
+		w.Header().Set("Content-Encoding", encoding)
+		r.Header.Del("Accept-Encoding")
+
+		h.ServeHTTP(&compressResponseWriter{w: w, enc: encWriter}, r)
+	})
+}
+
+type compressEncoder interface {
+	io.Writer
+	Flush() error
+}
+
+type compressResponseWriter struct {
+	w   http.ResponseWriter
+	enc compressEncoder
+}
+
+func (c *compressResponseWriter) Header() http.Header { return c.w.Header() }
+
+func (c *compressResponseWriter) WriteHeader(code int) {
+	c.w.Header().Del("Content-Length")
+	c.w.WriteHeader(code)
+}
+
+func (c *compressResponseWriter) Write(b []byte) (int, error) {
+	h := c.w.Header()
+	if h.Get("Content-Type") == "" {
+		h.Set("Content-Type", http.DetectContentType(b))
+	}
+	h.Del("Content-Length")
+	return c.enc.Write(b)
+}
+
+func (c *compressResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(c.enc, r)
+}
+
+func (c *compressResponseWriter) Flush() {
+	_ = c.enc.Flush()
+	if f, ok := c.w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func decompressHandler(logger *zap.Logger, h http.Handler) http.HandlerFunc {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Header.Get("Content-Encoding") {
 		case "gzip":
 			gr, err := gzip.NewReader(r.Body)
@@ -510,69 +660,140 @@ func decompressHandler(logger *zap.Logger, h http.Handler) http.HandlerFunc {
 			// No request compression.
 		}
 		h.ServeHTTP(w, r)
-	})
+	}
 }
 
-func extractClientAddressFromContext(logger *zap.Logger, ctx context.Context) (string, string) {
-	var clientAddr string
+func extractClientAddressFromContext(logger *zap.Logger, config Config, ctx context.Context) (string, string) {
+	var candidateAddresses []string
 	md, _ := metadata.FromIncomingContext(ctx)
 	if ips := md.Get("x-forwarded-for"); len(ips) > 0 {
 		// Look for gRPC-Gateway / LB header.
-		clientAddr = strings.Split(ips[0], ",")[0]
-	} else if peerInfo, ok := peer.FromContext(ctx); ok {
-		// If missing, try to look up gRPC peer info.
-		clientAddr = peerInfo.Addr.String()
-	}
-
-	return extractClientAddress(logger, clientAddr, ctx, "context")
-}
-
-func extractClientAddressFromRequest(logger *zap.Logger, r *http.Request) (string, string) {
-	var clientAddr string
-	if ips := r.Header.Get("x-forwarded-for"); len(ips) > 0 {
-		clientAddr = strings.Split(ips, ",")[0]
-	} else {
-		clientAddr = r.RemoteAddr
-	}
-
-	return extractClientAddress(logger, clientAddr, r, "request")
-}
-
-func extractClientAddress(logger *zap.Logger, clientAddr string, source interface{}, sourceType string) (string, string) {
-	var clientIP, clientPort string
-
-	if clientAddr != "" {
-		// It's possible the request metadata had no client address string.
-
-		clientAddr = strings.TrimSpace(clientAddr)
-		if host, port, err := net.SplitHostPort(clientAddr); err == nil {
-			clientIP = host
-			clientPort = port
-		} else if addrErr, ok := err.(*net.AddrError); ok {
-			switch addrErr.Err {
-			case "missing port in address":
-				fallthrough
-			case "too many colons in address":
-				clientIP = clientAddr
-			default:
-				// Unknown address error, ignore the address.
+		candidateAddresses = strings.Split(ips[0], ",")
+		// Handle grpc-gateway loopback peer
+		if len(candidateAddresses) > 1 {
+			if peerInfo, ok := peer.FromContext(ctx); ok {
+				if host, _, err := net.SplitHostPort(peerInfo.Addr.String()); err == nil {
+					if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+						candidateAddresses = candidateAddresses[:len(candidateAddresses)-1]
+					}
+				}
 			}
 		}
-		// At this point err may still be a non-nil value that's not a *net.AddrError, ignore the address.
+	} else if peerInfo, ok := peer.FromContext(ctx); ok {
+		// If missing, try to look up gRPC peer info.
+		candidateAddresses = []string{peerInfo.Addr.String()}
+	}
+
+	return extractClientAddress(logger, config, candidateAddresses, ctx, "context")
+}
+
+func extractClientAddressFromRequest(logger *zap.Logger, config Config, r *http.Request) (string, string) {
+	var candidateAddresses []string
+	if ips := r.Header.Get("x-forwarded-for"); len(ips) > 0 {
+		// Look for a LB header.
+		candidateAddresses = strings.Split(ips, ",")
+	} else {
+		// If missing, fall back to the remote address.
+		candidateAddresses = []string{r.RemoteAddr}
+	}
+
+	return extractClientAddress(logger, config, candidateAddresses, r, "request")
+}
+
+func extractClientAddress(logger *zap.Logger, config Config, candidateAddresses []string, source any, sourceType string) (string, string) {
+	var clientIP, clientPort string
+	var proxyCount int
+
+	for i, candidateAddresse := range slices.Backward(candidateAddresses) {
+		if clientIP != "" || clientPort != "" {
+			proxyCount++
+		}
+
+		candidateAddress := strings.TrimSpace(candidateAddresse)
+		if candidateAddress == "" {
+			// Skip empty candidate addresses, such as from trailing commas in headers.
+			continue
+		}
+
+		// Check if candidate is an address with no port.
+		if parsedCandidate := net.ParseIP(candidateAddress); parsedCandidate != nil {
+			if i > 0 && parsedCandidate.IsLoopback() {
+				// Skip any loopback addresses to ensure we don't record any local proxies like grpc-gateway as the client.
+				// If this is the last possible address, use it even if it's a loopback. This handles local testing cases.
+				continue
+			}
+
+			clientIP = candidateAddress
+			clientPort = ""
+			if proxyCount >= config.GetSocket().ProxyCount {
+				// If we've already seen the expected number of valid proxy addresses, assume the next one is the client.
+				break
+			} else {
+				// This is the first valid address we've found, so it's likely the proxy/LB. Check for one more.
+				continue
+			}
+		}
+
+		// Check if candidate address may be a host:port combination.
+		candidateHost, candidatePort, err := net.SplitHostPort(candidateAddress)
+		if err != nil {
+			var usable bool
+			if addrErr, ok := errors.AsType[*net.AddrError](err); ok {
+				// If it's a *net.AddrError the value may still be usable depending on the error itself.
+				switch addrErr.Err {
+				case "missing port in address":
+					fallthrough
+				case "too many colons in address":
+					candidateHost = candidateAddress
+					usable = true
+				default:
+					// Unknown address error, ignore the address.
+				}
+				if !usable {
+					continue
+				}
+			} else {
+				// At this point err may still be a non-nil value that's not a *net.AddrError, ignore the address.
+				continue
+			}
+		}
+
+		parsedCandidate := net.ParseIP(candidateHost)
+		if parsedCandidate == nil {
+			// Host is not a valid address, and must be skipped.
+			continue
+		}
+		if i > 0 && parsedCandidate.IsLoopback() {
+			// Skip any loopback addresses to ensure we don't record any local proxies like grpc-gateway as the client.
+			// If this is the last possible address, use it even if it's a loopback. This handles local testing cases.
+			continue
+		}
+
+		clientIP = candidateHost
+		clientPort = candidatePort
+		if proxyCount >= config.GetSocket().ProxyCount {
+			// If we've already seen the expected number of valid proxy addresses, assume the next one is the client.
+			break
+		} else {
+			// This is the first valid address we've found, so it's likely the proxy/LB. Check for one more.
+			continue
+		}
 	}
 
 	if clientIP == "" {
 		if r, isRequest := source.(*http.Request); isRequest {
-			source = map[string]interface{}{"headers": r.Header, "remote_addr": r.RemoteAddr}
+			sourceData := map[string]any{"x-forwarded-for": r.Header.Get("x-forwarded-for"), "remote_addr": r.RemoteAddr}
+			logger.Warn("cannot extract client address", zap.String("address_source_type", sourceType), zap.Any("address_source", sourceData))
+		} else {
+			logger.Warn("cannot extract client address", zap.String("address_source_type", sourceType))
 		}
-		logger.Warn("cannot extract client address", zap.String("address_source_type", sourceType), zap.Any("address_source", source))
 	}
 
 	return clientIP, clientPort
 }
 
-func traceApiBefore(ctx context.Context, logger *zap.Logger, metrics Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) error {
-	clientIP, clientPort := extractClientAddressFromContext(logger, ctx)
+func traceApiBefore(ctx context.Context, logger *zap.Logger, config Config, metrics Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) error {
+	clientIP, clientPort := extractClientAddressFromContext(logger, config, ctx)
 	start := time.Now()
 
 	// Execute the before hook itself.
@@ -583,12 +804,42 @@ func traceApiBefore(ctx context.Context, logger *zap.Logger, metrics Metrics, fu
 	return err
 }
 
-func traceApiAfter(ctx context.Context, logger *zap.Logger, metrics Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) {
-	clientIP, clientPort := extractClientAddressFromContext(logger, ctx)
+func traceApiAfter(ctx context.Context, logger *zap.Logger, config Config, metrics Metrics, fullMethodName string, fn func(clientIP, clientPort string) error) {
+	clientIP, clientPort := extractClientAddressFromContext(logger, config, ctx)
 	start := time.Now()
 
 	// Execute the after hook itself.
 	err := fn(clientIP, clientPort)
 
 	metrics.ApiAfter(fullMethodName, time.Since(start), err != nil)
+}
+
+func handleRoutingError(ctx context.Context, mux *grpcgw.ServeMux, marshaler grpcgw.Marshaler, w http.ResponseWriter, r *http.Request, httpStatus int) {
+	sterr := status.Error(codes.Internal, "Unexpected routing error")
+	switch httpStatus {
+	case http.StatusBadRequest:
+		sterr = status.Error(codes.InvalidArgument, http.StatusText(httpStatus))
+	case http.StatusMethodNotAllowed:
+		sterr = status.Error(codes.Unimplemented, http.StatusText(httpStatus))
+	case http.StatusNotFound:
+		sterr = status.Error(codes.NotFound, http.StatusText(httpStatus))
+	}
+
+	// Set empty ServerMetadata to prevent logging error on nil metadata.
+	handleHTTPError(grpcgw.NewServerMetadataContext(ctx, grpcgw.ServerMetadata{}), mux, marshaler, w, r, sterr)
+}
+
+func handleHTTPError(ctx context.Context, mux *grpcgw.ServeMux, marshaler grpcgw.Marshaler, w http.ResponseWriter, r *http.Request, err error) {
+	grpcgw.DefaultHTTPErrorHandler(ctx, mux, marshaler, &wwwAuthenticateFixWriter{ResponseWriter: w}, r, err)
+}
+
+type wwwAuthenticateFixWriter struct {
+	http.ResponseWriter
+}
+
+func (w *wwwAuthenticateFixWriter) WriteHeader(statusCode int) {
+	if statusCode == http.StatusUnauthorized {
+		w.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer realm="nakama"`)
+	}
+	w.ResponseWriter.WriteHeader(statusCode)
 }

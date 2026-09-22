@@ -22,14 +22,15 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/runtime"
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 )
 
@@ -38,6 +39,8 @@ type walletLedgerListCursor struct {
 	CreateTime time.Time
 	Id         string
 	IsNext     bool
+	After      time.Time
+	Before     time.Time
 }
 
 // Not an API entity, only used to receive data from runtime environment.
@@ -53,7 +56,7 @@ type walletLedger struct {
 	ID         string
 	UserID     string
 	Changeset  map[string]int64
-	Metadata   map[string]interface{}
+	Metadata   map[string]any
 	CreateTime int64
 	UpdateTime int64
 }
@@ -78,7 +81,7 @@ func (w *walletLedger) GetChangeset() map[string]int64 {
 	return w.Changeset
 }
 
-func (w *walletLedger) GetMetadata() map[string]interface{} {
+func (w *walletLedger) GetMetadata() map[string]any {
 	return w.Metadata
 }
 
@@ -89,13 +92,7 @@ func UpdateWallets(ctx context.Context, logger *zap.Logger, db *sql.DB, updates 
 
 	var results []*runtime.WalletUpdateResult
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return nil, err
-	}
-
-	if err = ExecuteInTx(ctx, tx, func() error {
+	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
 		var updateErr error
 		results, updateErr = updateWallets(ctx, logger, tx, updates, updateLedger)
 		if updateErr != nil {
@@ -116,23 +113,21 @@ func UpdateWallets(ctx context.Context, logger *zap.Logger, db *sql.DB, updates 
 	return results, nil
 }
 
-func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates []*walletUpdate, updateLedger bool) ([]*runtime.WalletUpdateResult, error) {
+func updateWallets(ctx context.Context, logger *zap.Logger, tx pgx.Tx, updates []*walletUpdate, updateLedger bool) ([]*runtime.WalletUpdateResult, error) {
 	if len(updates) == 0 {
 		return nil, nil
 	}
 
-	initialParams := make([]interface{}, 0, len(updates))
-	initialStatements := make([]string, 0, len(updates))
+	ids := make([]uuid.UUID, 0, len(updates))
 	for _, update := range updates {
-		initialParams = append(initialParams, update.UserID)
-		initialStatements = append(initialStatements, "$"+strconv.Itoa(len(initialParams))+"::UUID")
+		ids = append(ids, update.UserID)
 	}
 
-	initialQuery := "SELECT id, wallet FROM users WHERE id IN (" + strings.Join(initialStatements, ",") + ")"
+	initialQuery := "SELECT id, wallet FROM users WHERE id = ANY($1::UUID[]) FOR UPDATE"
 
 	// Select the wallets from the DB and decode them.
 	wallets := make(map[string]map[string]int64, len(updates))
-	rows, err := tx.QueryContext(ctx, initialQuery, initialParams...)
+	rows, err := tx.Query(ctx, initialQuery, ids)
 	if err != nil {
 		logger.Debug("Error retrieving user wallets.", zap.Error(err))
 		return nil, err
@@ -142,7 +137,7 @@ func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates 
 		var wallet sql.NullString
 		err = rows.Scan(&id, &wallet)
 		if err != nil {
-			_ = rows.Close()
+			rows.Close()
 			logger.Debug("Error reading user wallets.", zap.Error(err))
 			return nil, err
 		}
@@ -150,25 +145,30 @@ func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates 
 		var walletMap map[string]int64
 		err = json.Unmarshal([]byte(wallet.String), &walletMap)
 		if err != nil {
-			_ = rows.Close()
+			rows.Close()
 			logger.Debug("Error converting user wallet.", zap.String("user_id", id), zap.Error(err))
 			return nil, err
 		}
 
 		wallets[id] = walletMap
 	}
-	_ = rows.Close()
+	rows.Close()
 
 	results := make([]*runtime.WalletUpdateResult, 0, len(updates))
 
 	// Prepare the set of wallet updates and ledger updates.
 	updatedWallets := make(map[string][]byte, len(updates))
 	updateOrder := make([]string, 0, len(updates))
-	var statements []string
-	var params []interface{}
+
+	var idParams []uuid.UUID
+	var userIdParams []string
+	var changesetParams [][]byte
+	var metadataParams []string
 	if updateLedger {
-		statements = make([]string, 0, len(updates))
-		params = make([]interface{}, 0, len(updates)*4)
+		idParams = make([]uuid.UUID, 0, len(updates))
+		userIdParams = make([]string, 0, len(updates))
+		changesetParams = make([][]byte, 0, len(updates))
+		metadataParams = make([]string, 0, len(updates))
 	}
 
 	// Go through the changesets and attempt to calculate the new state for each wallet.
@@ -182,9 +182,7 @@ func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates 
 
 		// Deep copy the previous state of the wallet.
 		previousMap := make(map[string]int64, len(walletMap))
-		for k, v := range walletMap {
-			previousMap[k] = v
-		}
+		maps.Copy(previousMap, walletMap)
 		result := &runtime.WalletUpdateResult{UserID: userID, Previous: previousMap}
 
 		for k, v := range update.Changeset {
@@ -221,8 +219,10 @@ func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates 
 				return nil, err
 			}
 
-			params = append(params, uuid.Must(uuid.NewV4()), userID, changesetData, update.Metadata)
-			statements = append(statements, fmt.Sprintf("($%v::UUID, $%v, $%v, $%v)", strconv.Itoa(len(params)-3), strconv.Itoa(len(params)-2), strconv.Itoa(len(params)-1), strconv.Itoa(len(params))))
+			idParams = append(idParams, uuid.Must(uuid.NewV4()))
+			userIdParams = append(userIdParams, userID)
+			changesetParams = append(changesetParams, changesetData)
+			metadataParams = append(metadataParams, update.Metadata)
 		}
 	}
 
@@ -238,7 +238,7 @@ func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates 
 				logger.Warn("Missing wallet update for user.", zap.String("user_id", userID))
 				continue
 			}
-			_, err = tx.ExecContext(ctx, "UPDATE users SET update_time = now(), wallet = $2 WHERE id = $1", userID, updatedWallet)
+			_, err = tx.Exec(ctx, "UPDATE users SET update_time = now(), wallet = $2 WHERE id = $1", userID, updatedWallet)
 			if err != nil {
 				logger.Debug("Error writing user wallet.", zap.String("user_id", userID), zap.Error(err))
 				return nil, err
@@ -246,8 +246,13 @@ func updateWallets(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates 
 		}
 
 		// Write the ledger updates, if any.
-		if updateLedger && (len(statements) > 0) {
-			_, err = tx.ExecContext(ctx, "INSERT INTO wallet_ledger (id, user_id, changeset, metadata) VALUES "+strings.Join(statements, ", "), params...)
+		if updateLedger && (len(idParams) > 0) {
+			_, err = tx.Exec(ctx, `
+INSERT INTO
+	wallet_ledger (id, user_id, changeset, metadata)
+SELECT
+	unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::jsonb[]), unnest($4::jsonb[]);
+`, idParams, userIdParams, changesetParams, metadataParams)
 			if err != nil {
 				logger.Debug("Error writing user wallet ledgers.", zap.Error(err))
 				return nil, err
@@ -286,7 +291,7 @@ func UpdateWalletLedger(ctx context.Context, logger *zap.Logger, db *sql.DB, id 
 	}, nil
 }
 
-func ListWalletLedger(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit *int, cursor string) ([]*walletLedger, string, string, error) {
+func ListWalletLedger(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit *int, cursor string, after, before time.Time) ([]*walletLedger, string, string, error) {
 	var incomingCursor *walletLedgerListCursor
 	if cursor != "" {
 		cb, err := base64.URLEncoding.DecodeString(cursor)
@@ -302,21 +307,37 @@ func ListWalletLedger(ctx context.Context, logger *zap.Logger, db *sql.DB, userI
 		if userID.String() != incomingCursor.UserId {
 			return nil, "", "", runtime.ErrWalletLedgerInvalidCursor
 		}
+		if !after.Equal(incomingCursor.After) {
+			return nil, "", "", runtime.ErrWalletLedgerInvalidCursor
+		}
+		if !before.Equal(incomingCursor.Before) {
+			return nil, "", "", runtime.ErrWalletLedgerInvalidCursor
+		}
 	}
 
-	params := []interface{}{userID, time.Now().UTC(), uuid.UUID{}}
+	params := []any{userID, time.Now().UTC(), uuid.UUID{}}
 	if incomingCursor != nil {
 		params[1] = incomingCursor.CreateTime
 		params[2] = incomingCursor.Id
 	}
 
-	query := `SELECT id, changeset, metadata, create_time, update_time FROM wallet_ledger WHERE user_id = $1::UUID AND (user_id, create_time, id) < ($1::UUID, $2, $3::UUID) ORDER BY create_time DESC`
+	query := `SELECT id, changeset, metadata, create_time, update_time FROM wallet_ledger WHERE user_id = $1::UUID AND (user_id, create_time, id) < ($1::UUID, $2, $3::UUID)`
+	order := " ORDER BY create_time DESC"
 	if incomingCursor != nil && !incomingCursor.IsNext {
-		query = `SELECT id, changeset, metadata, create_time, update_time FROM wallet_ledger WHERE user_id = $1::UUID AND (user_id, create_time, id) > ($1::UUID, $2, $3::UUID) ORDER BY create_time ASC`
+		query = `SELECT id, changeset, metadata, create_time, update_time FROM wallet_ledger WHERE user_id = $1::UUID AND (user_id, create_time, id) > ($1::UUID, $2, $3::UUID)`
+		order = " ORDER BY create_time ASC"
 	}
-
+	if !after.IsZero() {
+		params = append(params, after)
+		query += fmt.Sprintf(" AND create_time > $%v", len(params))
+	}
+	if !before.IsZero() {
+		params = append(params, before)
+		query += fmt.Sprintf(" AND create_time < $%v", len(params))
+	}
+	query += order
 	if limit != nil {
-		query = fmt.Sprintf(`%s LIMIT %v`, query, *limit+1)
+		query += fmt.Sprintf(` LIMIT %v`, *limit+1)
 	}
 
 	results := make([]*walletLedger, 0, 10)
@@ -358,7 +379,7 @@ func ListWalletLedger(ctx context.Context, logger *zap.Logger, db *sql.DB, userI
 			return nil, "", "", err
 		}
 
-		var metadataMap map[string]interface{}
+		var metadataMap map[string]any
 		err = json.Unmarshal([]byte(metadata.String), &metadataMap)
 		if err != nil {
 			logger.Error("Error converting user wallet ledger metadata.", zap.String("user_id", userID.String()), zap.Error(err))
@@ -394,9 +415,7 @@ func ListWalletLedger(ctx context.Context, logger *zap.Logger, db *sql.DB, userI
 			nextCursor.IsNext = !nextCursor.IsNext
 		}
 
-		for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
-			results[i], results[j] = results[j], results[i]
-		}
+		slices.Reverse(results)
 	}
 
 	var nextCursorStr string

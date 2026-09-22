@@ -16,10 +16,11 @@ package server
 
 import (
 	"context"
-	"github.com/heroiclabs/nakama-common/runtime"
+	"errors"
 	"strings"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
+	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -27,8 +28,9 @@ import (
 )
 
 func (s *ConsoleServer) ListMatches(ctx context.Context, in *console.ListMatchesRequest) (*console.MatchList, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	matchID := in.MatchId
-	// Try get match ID for authoritative query
+	// Try to get match ID for authoritative query.
 	if in.Authoritative != nil && in.Authoritative.Value && in.Query != nil {
 		matchID = in.Query.Value
 	}
@@ -40,12 +42,12 @@ func (s *ConsoleServer) ListMatches(ctx context.Context, in *console.ListMatches
 			}
 			return &console.MatchList{Matches: []*console.MatchList_Match{{ApiMatch: match, Node: node}}}, nil
 		} else {
-			if err == runtime.ErrMatchIdInvalid {
+			if errors.Is(err, runtime.ErrMatchIdInvalid) {
 				if (in.Authoritative != nil && !in.Authoritative.Value) || in.Authoritative == nil {
 					return nil, status.Error(codes.InvalidArgument, "Match ID is not valid.")
 				}
 			} else {
-				s.logger.Error("Error listing matches", zap.Error(err))
+				logger.Error("Error listing matches", zap.Error(err))
 				return nil, status.Error(codes.Internal, "Error listing matches.")
 			}
 		}
@@ -77,7 +79,7 @@ func (s *ConsoleServer) ListMatches(ctx context.Context, in *console.ListMatches
 
 	matches, nodes, err := s.matchRegistry.ListMatches(ctx, limit, in.Authoritative, in.Label, in.MinSize, in.MaxSize, in.Query, in.Node)
 	if err != nil {
-		s.logger.Error("Error listing matches", zap.Error(err))
+		logger.Error("Error listing matches", zap.Error(err))
 		return nil, status.Error(codes.Internal, "Error listing matches.")
 	}
 
@@ -94,6 +96,7 @@ func (s *ConsoleServer) ListMatches(ctx context.Context, in *console.ListMatches
 }
 
 func (s *ConsoleServer) GetMatchState(ctx context.Context, in *console.MatchStateRequest) (*console.MatchState, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	// Validate the match ID.
 	matchIDComponents := strings.SplitN(in.GetId(), ".", 2)
 	if len(matchIDComponents) != 2 {
@@ -111,10 +114,14 @@ func (s *ConsoleServer) GetMatchState(ctx context.Context, in *console.MatchStat
 
 	presences, tick, state, err := s.matchRegistry.GetState(ctx, matchID, node)
 	if err != nil {
-		if err != context.Canceled && err != runtime.ErrMatchNotFound {
-			s.logger.Error("Error getting match state.", zap.Any("in", in), zap.Error(err))
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, runtime.ErrMatchNotFound) {
+			logger.Error("Error getting match state.", zap.Any("in", in), zap.Error(err))
 		}
-		if err == runtime.ErrMatchNotFound {
+		if errors.Is(err, runtime.ErrMatchNotFound) {
+			// Speed up the clearing of this match label from the registry.
+			if err := s.matchRegistry.ClearMatchLabel(matchID, node); err != nil {
+				logger.Error("Error clearing match label.", zap.Any("in", in), zap.Error(err))
+			}
 			return nil, status.Error(codes.InvalidArgument, "Match not found, or match handler already stopped.")
 		}
 		return nil, status.Error(codes.Internal, "Error listing matches.")

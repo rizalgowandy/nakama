@@ -13,12 +13,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/internal/codegenerator"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/internal/descriptor"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway/internal/gengateway"
+	"google.golang.org/grpc/grpclog"
 	"google.golang.org/protobuf/compiler/protogen"
 )
 
@@ -35,6 +36,9 @@ var (
 	versionFlag                = flag.Bool("version", false, "print the current version")
 	warnOnUnboundMethods       = flag.Bool("warn_on_unbound_methods", false, "emit a warning message if an RPC method has no HttpRule annotation")
 	generateUnboundMethods     = flag.Bool("generate_unbound_methods", false, "generate proxy methods even for RPC methods that have no HttpRule annotation")
+	useOpaqueAPI               = flag.Bool("use_opaque_api", false, "generate code compatible with the new Opaque API instead of the older Open Struct API")
+
+	_ = flag.Bool("logtostderr", false, "Legacy glog compatibility. This flag is a no-op, you can safely remove it")
 )
 
 // Variables set by goreleaser at build time
@@ -46,9 +50,22 @@ var (
 
 func main() {
 	flag.Parse()
-	defer glog.Flush()
 
 	if *versionFlag {
+		if commit == "unknown" {
+			buildInfo, ok := debug.ReadBuildInfo()
+			if ok {
+				version = buildInfo.Main.Version
+				for _, setting := range buildInfo.Settings {
+					if setting.Key == "vcs.revision" {
+						commit = setting.Value
+					}
+					if setting.Key == "vcs.time" {
+						date = setting.Value
+					}
+				}
+			}
+		}
 		fmt.Printf("Version %v, commit %v, built at %v\n", version, commit, date)
 		os.Exit(0)
 	}
@@ -58,16 +75,17 @@ func main() {
 	}.Run(func(gen *protogen.Plugin) error {
 		reg := descriptor.NewRegistry()
 
-		err := applyFlags(reg)
-		if err != nil {
+		if err := applyFlags(reg); err != nil {
 			return err
 		}
 
 		codegenerator.SetSupportedFeaturesOnPluginGen(gen)
 
-		generator := gengateway.New(reg, *useRequestContext, *registerFuncSuffix, *allowPatchFeature, *standalone)
+		generator := gengateway.New(reg, *useRequestContext, *registerFuncSuffix, *allowPatchFeature, *standalone, *useOpaqueAPI)
 
-		glog.V(1).Infof("Parsing code generator request")
+		if grpclog.V(1) {
+			grpclog.Infof("Parsing code generator request")
+		}
 
 		if err := reg.LoadFromPlugin(gen); err != nil {
 			return err
@@ -78,7 +96,7 @@ func main() {
 			return fmt.Errorf("HTTP rules without a matching selector: %s", strings.Join(unboundHTTPRules, ", "))
 		}
 
-		var targets []*descriptor.File
+		targets := make([]*descriptor.File, 0, len(gen.Request.FileToGenerate))
 		for _, target := range gen.Request.FileToGenerate {
 			f, err := reg.LookupFile(target)
 			if err != nil {
@@ -89,14 +107,19 @@ func main() {
 
 		files, err := generator.Generate(targets)
 		for _, f := range files {
-			glog.V(1).Infof("NewGeneratedFile %q in %s", f.GetName(), f.GoPkg)
+			if grpclog.V(1) {
+				grpclog.Infof("NewGeneratedFile %q in %s", f.GetName(), f.GoPkg)
+			}
+
 			genFile := gen.NewGeneratedFile(f.GetName(), protogen.GoImportPath(f.GoPkg.Path))
 			if _, err := genFile.Write([]byte(f.GetContent())); err != nil {
 				return err
 			}
 		}
 
-		glog.V(1).Info("Processed code generator request")
+		if grpclog.V(1) {
+			grpclog.Info("Processed code generator request")
+		}
 
 		return err
 	})
@@ -109,14 +132,14 @@ func applyFlags(reg *descriptor.Registry) error {
 		}
 	}
 	if *warnOnUnboundMethods && *generateUnboundMethods {
-		glog.Warningf("Option warn_on_unbound_methods has no effect when generate_unbound_methods is used.")
+		grpclog.Warningf("Option warn_on_unbound_methods has no effect when generate_unbound_methods is used.")
 	}
 	reg.SetStandalone(*standalone)
 	reg.SetAllowDeleteBody(*allowDeleteBody)
 
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "allow_repeated_fields_in_body" {
-			glog.Warning("The `allow_repeated_fields_in_body` flag is deprecated and will always behave as `true`.")
+			grpclog.Warning("The `allow_repeated_fields_in_body` flag is deprecated and will always behave as `true`.")
 		}
 	})
 

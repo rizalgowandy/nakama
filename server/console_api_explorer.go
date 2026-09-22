@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 type MethodName string
@@ -35,7 +36,8 @@ type methodReflection struct {
 }
 
 func (s *ConsoleServer) CallRpcEndpoint(ctx context.Context, in *console.CallApiEndpointRequest) (*console.CallApiEndpointResponse, error) {
-	callCtx, err := s.extractApiCallContext(ctx, in, true)
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
+	callCtx, err := s.extractApiCallContext(ctx, logger, in, true)
 	if err != nil {
 		return nil, err
 	}
@@ -55,11 +57,12 @@ func (s *ConsoleServer) CallRpcEndpoint(ctx context.Context, in *console.CallApi
 }
 
 func (s *ConsoleServer) CallApiEndpoint(ctx context.Context, in *console.CallApiEndpointRequest) (*console.CallApiEndpointResponse, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	r, ok := s.rpcMethodCache.endpoints[MethodName(in.Method)]
 	if !ok {
 		return nil, fmt.Errorf("API method doesn't exist: %s", in.Method)
 	}
-	callCtx, err := s.extractApiCallContext(ctx, in, false)
+	callCtx, err := s.extractApiCallContext(ctx, logger, in, false)
 	if err != nil {
 		return nil, err
 	}
@@ -68,9 +71,9 @@ func (s *ConsoleServer) CallApiEndpoint(ctx context.Context, in *console.CallApi
 	args[0] = reflect.ValueOf(s.api)
 	args[1] = reflect.ValueOf(callCtx)
 
-	if r.method.Type.In(2) == reflect.TypeOf(&emptypb.Empty{}) {
+	if r.method.Type.In(2) == reflect.TypeFor[*emptypb.Empty]() {
 		if in.Body != "" {
-			s.logger.Error("Body passed to an api call that doesn't accept any.", zap.String("method", in.Method))
+			logger.Error("Body passed to an api call that doesn't accept any.", zap.String("method", in.Method))
 			return nil, status.Error(codes.InvalidArgument, "Api method doesn't accept a request body.")
 		}
 		args[2] = reflect.ValueOf(&emptypb.Empty{})
@@ -78,7 +81,7 @@ func (s *ConsoleServer) CallApiEndpoint(ctx context.Context, in *console.CallApi
 		request := reflect.New(r.request).Interface().(proto.Message)
 		err = protojson.Unmarshal([]byte(in.Body), request)
 		if err != nil {
-			s.logger.Error("Error parsing method request body.", zap.String("method", in.Method), zap.Error(err))
+			logger.Error("Error parsing method request body.", zap.String("method", in.Method), zap.Error(err))
 			return nil, status.Error(codes.InvalidArgument, "Error parsing method request body.")
 		}
 		args[2] = reflect.ValueOf(request)
@@ -97,7 +100,7 @@ func (s *ConsoleServer) CallApiEndpoint(ctx context.Context, in *console.CallApi
 			m := new(protojson.MarshalOptions)
 			j, err = m.Marshal(cval.(proto.Message))
 			if err != nil {
-				s.logger.Error("Error serializing method response body.", zap.String("method", in.Method), zap.Error(err))
+				logger.Error("Error serializing method response body.", zap.String("method", in.Method), zap.Error(err))
 				return nil, status.Error(codes.Internal, "Error serializing method response body.")
 			}
 		}
@@ -107,13 +110,13 @@ func (s *ConsoleServer) CallApiEndpoint(ctx context.Context, in *console.CallApi
 	}
 }
 
-func (s *ConsoleServer) extractApiCallContext(ctx context.Context, in *console.CallApiEndpointRequest, userIdOptional bool) (context.Context, error) {
+func (s *ConsoleServer) extractApiCallContext(ctx context.Context, logger *zap.Logger, in *console.CallApiEndpointRequest, userIdOptional bool) (context.Context, error) {
 	var callCtx context.Context
 	if strings.HasPrefix(in.Method, "Authenticate") {
 		callCtx = context.WithValue(ctx, ctxFullMethodKey{}, "/nakama.api.Nakama/"+in.Method)
 	} else if in.UserId == "" {
 		if !userIdOptional {
-			s.logger.Error("Error calling a built-in RPC function without a user_id.", zap.String("method", in.Method))
+			logger.Error("Error calling a built-in RPC function without a user_id.", zap.String("method", in.Method))
 			return nil, status.Error(codes.InvalidArgument, "Built-in RPC functions require a user_id.")
 		} else {
 			callCtx = context.WithValue(ctx, ctxFullMethodKey{}, "/nakama.api.Nakama/"+in.Method)
@@ -123,16 +126,16 @@ func (s *ConsoleServer) extractApiCallContext(ctx context.Context, in *console.C
 		var dbUsername string
 		userUUID, err := uuid.FromString(in.UserId)
 		if err != nil {
-			s.logger.Error("Invalid user uuid.", zap.String("method", in.Method))
+			logger.Error("Invalid user uuid.", zap.String("method", in.Method))
 			return nil, status.Error(codes.InvalidArgument, "Invalid user uuid.")
 		}
 		err = row.Scan(&dbUsername)
 		if err != nil {
 			if err == sql.ErrNoRows {
-				s.logger.Error("User id not found.", zap.String("method", in.Method))
+				logger.Error("User id not found.", zap.String("method", in.Method))
 				return nil, status.Error(codes.InvalidArgument, "User id not found.")
 			}
-			s.logger.Error("Error looking up user account.", zap.String("method", in.Method), zap.Error(err))
+			logger.Error("Error looking up user account.", zap.String("method", in.Method), zap.Error(err))
 			return nil, status.Error(codes.Internal, "Error looking up user account.")
 		}
 		callCtx = context.WithValue(ctx, ctxUserIDKey{}, userUUID)
@@ -140,6 +143,9 @@ func (s *ConsoleServer) extractApiCallContext(ctx context.Context, in *console.C
 		callCtx = context.WithValue(callCtx, ctxVarsKey{}, map[string]string{})
 		callCtx = context.WithValue(callCtx, ctxExpiryKey{}, time.Now().Add(time.Duration(s.config.GetSession().TokenExpirySec)*time.Second).Unix())
 		callCtx = context.WithValue(callCtx, ctxFullMethodKey{}, "/nakama.api.Nakama/"+in.Method)
+		if in.SessionVars != nil {
+			callCtx = context.WithValue(callCtx, ctxVarsKey{}, in.SessionVars)
+		}
 	}
 	return callCtx, nil
 }
@@ -181,8 +187,8 @@ func (s *ConsoleServer) ListApiEndpoints(ctx context.Context, _ *emptypb.Empty) 
 func (s *ConsoleServer) initRpcMethodCache() error {
 	endpoints := make(map[MethodName]*methodReflection)
 	apiType := reflect.TypeOf(s.api)
-	for i := 0; i < apiType.NumMethod(); i++ {
-		method := apiType.Method(i)
+	for method := range apiType.Methods() {
+		method := method
 		if method.Type.NumIn() != 3 || method.Type.NumOut() != 2 {
 			continue
 		}
@@ -197,8 +203,8 @@ func (s *ConsoleServer) initRpcMethodCache() error {
 
 		request := method.Type.In(2)
 
-		if request != reflect.TypeOf(&emptypb.Empty{}) {
-			if request.Kind() == reflect.Ptr {
+		if request != reflect.TypeFor[*emptypb.Empty]() {
+			if request.Kind() == reflect.Pointer {
 				request = request.Elem()
 			}
 			bodyTemplate, err = reflectProtoMessageAsJsonTemplate(request)
@@ -236,8 +242,20 @@ func (s *ConsoleServer) initRpcMethodCache() error {
 func reflectProtoMessageAsJsonTemplate(s reflect.Type) (string, error) {
 	var populate func(m reflect.Value) reflect.Value
 	populate = func(m reflect.Value) reflect.Value {
+		if m.Type() == reflect.TypeFor[*structpb.Struct]() {
+			// Create a placeholder map to serve as a visual JSON template.
+			placeholderMap := map[string]any{
+				"<string>": "<any>",
+			}
+			pbStruct, err := structpb.NewStruct(placeholderMap)
+			if err == nil {
+				m.Set(reflect.ValueOf(pbStruct))
+				return m
+			}
+		}
+
 		switch m.Kind() {
-		case reflect.Ptr:
+		case reflect.Pointer:
 			if m.IsNil() {
 				m.Set(reflect.New(m.Type().Elem()))
 			}
@@ -262,10 +280,10 @@ func reflectProtoMessageAsJsonTemplate(s reflect.Type) (string, error) {
 		case reflect.Int16:
 			m.Set(reflect.ValueOf(int16(0)))
 		case reflect.Int32:
-			if m.Type().AssignableTo(reflect.TypeOf(int32(0))) {
+			if m.Type().AssignableTo(reflect.TypeFor[int32]()) {
 				m.Set(reflect.ValueOf(int32(0)))
 			} else {
-				// Handle special Int32 case for proto defined Enums
+				// Handle special Int32 case for proto defined Enums.
 				m.Set(m.Convert(m.Type()))
 			}
 		case reflect.Int64:
@@ -288,7 +306,12 @@ func reflectProtoMessageAsJsonTemplate(s reflect.Type) (string, error) {
 			for i := 0; i < m.NumField(); i++ {
 				field := m.Field(i)
 				fieldName := m.Type().Field(i).Name
+				// This also catches unexported fields safely via field name case.
 				if fieldName[0] == strings.ToLower(fieldName)[0] {
+					continue
+				}
+				// Explicitly ignore internal runtime fields that can't be set.
+				if !field.CanSet() {
 					continue
 				}
 				populate(field)

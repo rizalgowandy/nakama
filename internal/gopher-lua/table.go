@@ -1,5 +1,7 @@
 package lua
 
+import "slices"
+
 const defaultArrayCap = 32
 const defaultHashCap = 32
 
@@ -52,8 +54,8 @@ func (tb *LTable) Len() int {
 		return 0
 	}
 	var prev LValue = LNil
-	for i := len(tb.array) - 1; i >= 0; i-- {
-		v := tb.array[i]
+	for i, v := range slices.Backward(tb.array) {
+
 		if prev == LNil && v != LNil {
 			return i + 1
 		}
@@ -62,7 +64,7 @@ func (tb *LTable) Len() int {
 	return 0
 }
 
-// RaiseIfReadonly should be called from code on the path between the lua script and the table operation to ensure that
+// RaiseIfReadOnly should be called from code on the path between the lua script and the table operation to ensure that
 // the given table is writable
 func (tb *LTable) RaiseIfReadOnly(L *LState) {
 	if tb.ReadOnly {
@@ -128,8 +130,8 @@ func (tb *LTable) MaxN() int {
 	if tb.array == nil {
 		return 0
 	}
-	for i := len(tb.array) - 1; i >= 0; i-- {
-		if tb.array[i] != LNil {
+	for i, v := range slices.Backward(tb.array) {
+		if v != LNil {
 			return i + 1
 		}
 	}
@@ -312,7 +314,7 @@ func (tb *LTable) RawGetInt(key int) LValue {
 	return tb.array[index]
 }
 
-// RawGet returns an LValue associated with a given key without __index metamethod.
+// RawGetH returns an LValue associated with a given key without __index metamethod.
 func (tb *LTable) RawGetH(key LValue) LValue {
 	if s, sok := key.(LString); sok {
 		if tb.strdict == nil {

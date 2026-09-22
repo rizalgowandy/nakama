@@ -2,6 +2,7 @@ package genopenapi
 
 import (
 	"reflect"
+	"regexp"
 	"strings"
 )
 
@@ -17,6 +18,8 @@ func LookupNamingStrategy(strategyName string) func([]string) map[string]string 
 		return resolveNamesLegacy
 	case "simple":
 		return resolveNamesSimple
+	case "package":
+		return resolveNamesPackage
 	}
 	return nil
 }
@@ -41,7 +44,7 @@ func resolveNamesFQN(messages []string) map[string]string {
 // E.g., if the fully qualified name is `.a.b.C.D`, and there are other messages with fully
 // qualified names ending in `.D` but not in `.C.D`, it assigns the unique name `bCD`.
 func resolveNamesLegacy(messages []string) map[string]string {
-	return resolveNamesUniqueWithContext(messages, 1, "")
+	return resolveNamesUniqueWithContext(messages, 1, "", false)
 }
 
 // resolveNamesSimple takes the names of all proto messages and generates unique references by using a simple
@@ -52,20 +55,48 @@ func resolveNamesLegacy(messages []string) map[string]string {
 // E.g., if the fully qualified name is `.a.b.C.D`, and there are other messages with
 // fully qualified names ending in `.D` but not in `.C.D`, it assigns the unique name `C.D`.
 func resolveNamesSimple(messages []string) map[string]string {
-	return resolveNamesUniqueWithContext(messages, 0, ".")
+	return resolveNamesUniqueWithContext(messages, 0, ".", false)
 }
+
+// resolveNamesPackage takes the names of all proto messages and generates unique references by
+// starting with the package-scoped name (with nested message types qualified by their containing
+// "parent" types), and then following the "simple" heuristic above to add package name components
+// until each message has a unique name with a "." between each component.
+//
+// E.g., if the fully qualified name is `.a.b.C.D`, the name is `C.D` unless there is another
+// package-scoped name ending in "C.D", in  which case it would be `b.C.D` (unless that also
+// conflicted, in which case the name would be the fully-qualified `a.b.C`).
+func resolveNamesPackage(messages []string) map[string]string {
+	return resolveNamesUniqueWithContext(messages, 0, ".", true)
+}
+
+// For the "package" naming strategy, we rely on the convention that package names are lowercase
+// but message names are capitalized.
+var pkgEndRegexp = regexp.MustCompile(`\.[A-Z]`)
 
 // Take the names of every proto message and generates a unique reference by:
 // first, separating each message name into its components by splitting at dots. Then,
 // take the shortest suffix slice from each components slice that is unique among all
 // messages, and convert it into a component name by taking extraContext additional
 // components into consideration and joining all components with componentSeparator.
-func resolveNamesUniqueWithContext(messages []string, extraContext int, componentSeparator string) map[string]string {
+func resolveNamesUniqueWithContext(messages []string, extraContext int, componentSeparator string, qualifyNestedMessages bool) map[string]string {
 	packagesByDepth := make(map[int][][]string)
 	uniqueNames := make(map[string]string)
 
 	hierarchy := func(pkg string) []string {
-		return strings.Split(pkg, ".")
+		if !qualifyNestedMessages {
+			return strings.Split(pkg, ".")
+		}
+		pkgEnd := pkgEndRegexp.FindStringIndex(pkg)
+		if pkgEnd == nil {
+			// Fall back to non-qualified behavior if search based on convention fails.
+			return strings.Split(pkg, ".")
+		}
+		// Return each package component as an element, followed by the full message name
+		// (potentially qualified, if nested) as a single element.
+		qualifiedPkgName := pkg[:pkgEnd[0]]
+		nestedTypeName := pkg[pkgEnd[0]+1:]
+		return append(strings.Split(qualifiedPkgName, "."), nestedTypeName)
 	}
 
 	for _, p := range messages {
@@ -104,7 +135,27 @@ func resolveNamesUniqueWithContext(messages []string, extraContext int, componen
 		if start < 0 {
 			start = 0
 		}
-		uniqueNames[p] = strings.Join(h[start:], componentSeparator)
+		components := h[start:]
+		// When using empty separator (legacy mode), apply camelCase by title-casing
+		// intermediate lowercase package components. E.g., "google.rpc.Status" -> "googleRpcStatus"
+		// We only title-case components that are entirely lowercase (package names),
+		// not message names which are already PascalCase.
+		// Skip the first non-empty component (keep it lowercase for camelCase).
+		if componentSeparator == "" && len(components) > 1 {
+			firstNonEmpty := -1
+			for i := 0; i < len(components); i++ {
+				if components[i] != "" {
+					firstNonEmpty = i
+					break
+				}
+			}
+			for i := firstNonEmpty + 1; i < len(components); i++ {
+				if len(components[i]) > 0 && components[i] == strings.ToLower(components[i]) {
+					components[i] = strings.ToUpper(components[i][:1]) + components[i][1:]
+				}
+			}
+		}
+		uniqueNames[p] = strings.Join(components, componentSeparator)
 	}
 	return uniqueNames
 }

@@ -15,6 +15,8 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -24,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -31,8 +34,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/heroiclabs/nakama-common/runtime"
 )
+
+const AppleRootPEM = `
+-----BEGIN CERTIFICATE-----
+MIICQzCCAcmgAwIBAgIILcX8iNLFS5UwCgYIKoZIzj0EAwMwZzEbMBkGA1UEAwwS
+QXBwbGUgUm9vdCBDQSAtIEczMSYwJAYDVQQLDB1BcHBsZSBDZXJ0aWZpY2F0aW9u
+IEF1dGhvcml0eTETMBEGA1UECgwKQXBwbGUgSW5jLjELMAkGA1UEBhMCVVMwHhcN
+MTQwNDMwMTgxOTA2WhcNMzkwNDMwMTgxOTA2WjBnMRswGQYDVQQDDBJBcHBsZSBS
+b290IENBIC0gRzMxJjAkBgNVBAsMHUFwcGxlIENlcnRpZmljYXRpb24gQXV0aG9y
+aXR5MRMwEQYDVQQKDApBcHBsZSBJbmMuMQswCQYDVQQGEwJVUzB2MBAGByqGSM49
+AgEGBSuBBAAiA2IABJjpLz1AcqTtkyJygRMc3RCV8cWjTnHcFBbZDuWmBSp3ZHtf
+TjjTuxxEtX/1H7YyYl3J6YRbTzBPEVoA/VhYDKX1DyxNB0cTddqXl5dvMVztK517
+IDvYuVTZXpmkOlEKMaNCMEAwHQYDVR0OBBYEFLuw3qFYM4iapIqZ3r6966/ayySr
+MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMDA2gA
+MGUCMQCD6cHEFl4aXTQY2e3v9GwOAEZLuN+yRhHFD/3meoyhpmvOwgPUnPWTxnS4
+at+qIxUCMG1mihDK1A3UT82NQz60imOlM27jbdoXt2QfyFMm+YhidDkLF1vLUagM
+6BgD56KyKA==
+-----END CERTIFICATE-----
+`
 
 const (
 	AppleReceiptValidationUrlSandbox    = "https://sandbox.itunes.apple.com/verifyReceipt"
@@ -140,15 +162,15 @@ type ValidateReceiptAppleResponse struct {
 	Environment        string                                           `json:"environment"`  // possible values: 'Sandbox', 'Production'.
 	IsRetryable        bool                                             `json:"is-retryable"` // If true, request must be retried later.
 	LatestReceipt      string                                           `json:"latest_receipt"`
-	LatestReceiptInfo  []ValidateReceiptAppleResponseLatestReceiptInfo  `json:"latest_receipt_info"`  // Only returned for auto-renewable subscriptions.
+	LatestReceiptInfo  []ValidateReceiptAppleResponseLatestReceiptInfo  `json:"latest_receipt_info"`
 	PendingRenewalInfo []ValidateReceiptAppleResponsePendingRenewalInfo `json:"pending_renewal_info"` // Only returned for auto-renewable subscriptions.
 	Receipt            *ValidateReceiptAppleResponseReceipt             `json:"receipt"`
 	Status             int                                              `json:"status"`
 }
 
 // Validate an IAP receipt with Apple. This function will check against both the production and sandbox Apple URLs.
-func ValidateReceiptApple(ctx context.Context, httpc *http.Client, receipt, password string) (*ValidateReceiptAppleResponse, []byte, error) {
-	resp, raw, err := ValidateReceiptAppleWithUrl(ctx, httpc, AppleReceiptValidationUrlProduction, receipt, password)
+func ValidateLegacyReceiptApple(ctx context.Context, httpc *http.Client, password, receipt string) (*ValidateReceiptAppleResponse, []byte, error) {
+	resp, raw, err := ValidateLegacyReceiptAppleWithUrl(ctx, httpc, AppleReceiptValidationUrlProduction, receipt, password)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -156,14 +178,14 @@ func ValidateReceiptApple(ctx context.Context, httpc *http.Client, receipt, pass
 	switch resp.Status {
 	case AppleReceiptIsFromTestSandbox:
 		// Receipt should be checked with the Apple sandbox.
-		return ValidateReceiptAppleWithUrl(ctx, httpc, AppleReceiptValidationUrlSandbox, receipt, password)
+		return ValidateLegacyReceiptAppleWithUrl(ctx, httpc, AppleReceiptValidationUrlSandbox, receipt, password)
 	}
 
 	return resp, raw, nil
 }
 
 // Validate an IAP receipt with Apple against the specified URL.
-func ValidateReceiptAppleWithUrl(ctx context.Context, httpc *http.Client, url, receipt, password string) (*ValidateReceiptAppleResponse, []byte, error) {
+func ValidateLegacyReceiptAppleWithUrl(ctx context.Context, httpc *http.Client, url, receipt, password string) (*ValidateReceiptAppleResponse, []byte, error) {
 	if len(url) < 1 {
 		return nil, nil, errors.New("'url' must not be empty")
 	}
@@ -176,7 +198,7 @@ func ValidateReceiptAppleWithUrl(ctx context.Context, httpc *http.Client, url, r
 		return nil, nil, errors.New("'password' must not be empty")
 	}
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"receipt-data":             receipt,
 		"exclude-old-transactions": true,
 		"password":                 password,
@@ -187,7 +209,7 @@ func ValidateReceiptAppleWithUrl(ctx context.Context, httpc *http.Client, url, r
 		return nil, nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, &w)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &w)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -216,14 +238,7 @@ func ValidateReceiptAppleWithUrl(ctx context.Context, httpc *http.Client, url, r
 			return sort.StringsAreSorted([]string{out.LatestReceiptInfo[j].ExpiresDateMs, out.LatestReceiptInfo[i].ExpiresDateMs})
 		})
 
-		switch out.Status {
-		case AppleReceiptIsFromTestSandbox:
-			fallthrough
-		case AppleReceiptIsValid:
-			fallthrough
-		default:
-			return &out, buf, nil
-		}
+		return &out, buf, nil
 	default:
 		return nil, nil, &ValidationError{
 			Err:        ErrNon200ServiceApple,
@@ -244,13 +259,14 @@ type ReceiptGoogle struct {
 	PurchaseToken string `json:"purchaseToken"`
 }
 
+// https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.products#ProductPurchase
 type ValidateReceiptGoogleResponse struct {
 	AcknowledgementState int    `json:"acknowledgementState"`
 	ConsumptionState     int    `json:"consumptionState"`
 	DeveloperPayload     string `json:"developerPayload"`
 	Kind                 string `json:"kind"`
 	OrderId              string `json:"orderId"`
-	PurchaseState        int    `json:"purchaseState"`
+	PurchaseState        int    `json:"purchaseState"` //Possible values are: 0. Purchased 1. Canceled 2. Pending
 	PurchaseTimeMillis   string `json:"purchaseTimeMillis"`
 	PurchaseType         int    `json:"purchaseType"`
 	RegionCode           string `json:"regionCode"`
@@ -267,7 +283,7 @@ type ValidateReceiptGoogleResponse struct {
 //	    \\\"price_currency_code\\\":\\\"EUR\\\",\\\"title\\\":\\\"..\\\",\\\"description\\\":\\\"..\\\",
 //	    \\\"skuDetailsToken\\\":\\\"..\\\"}\"}"
 func decodeReceiptGoogle(receipt string) (*ReceiptGoogle, error) {
-	var wrapper map[string]interface{}
+	var wrapper map[string]any
 	if err := json.Unmarshal([]byte(receipt), &wrapper); err != nil {
 		return nil, err
 	}
@@ -283,6 +299,10 @@ func decodeReceiptGoogle(receipt string) (*ReceiptGoogle, error) {
 	if err := json.Unmarshal([]byte(unwrapped), &gr); err != nil {
 		return nil, errors.New("receipt is malformed")
 	}
+	if gr.PackageName == "" {
+		return nil, errors.New("receipt is malformed")
+	}
+
 	return &gr, nil
 }
 
@@ -356,7 +376,7 @@ func getGoogleAccessToken(ctx context.Context, httpc *http.Client, email, privat
 	data.Set("assertion", signed)
 	body := data.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", authUrl, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authUrl, strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -435,7 +455,7 @@ func validateReceiptGoogleWithIDs(ctx context.Context, httpc *http.Client, token
 		RawQuery: fmt.Sprintf("access_token=%s", token),
 		Scheme:   "https",
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -472,127 +492,8 @@ func validateReceiptGoogleWithIDs(ctx context.Context, httpc *http.Client, token
 	}
 }
 
-func ListVoidedReceiptsGoogle(ctx context.Context, httpc *http.Client, clientEmail, privateKey, packageName string) ([]ListVoidedReceiptsGoogleVoidedPurchase, error) {
-	if len(clientEmail) < 1 {
-		return nil, errors.New("'clientEmail' must not be empty")
-	}
-
-	if len(privateKey) < 1 {
-		return nil, errors.New("'privateKey' must not be empty")
-	}
-
-	token, err := getGoogleAccessToken(ctx, httpc, clientEmail, privateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	return listVoidedReceiptsGoogleWithIDs(ctx, httpc, packageName, token)
-}
-
-type listVoidedReceiptsGoogleResponse struct {
-	PageInfo        ListVoidedReceiptsGooglePageInfo         `json:"pageInfo"`
-	TokenPagination ListVoidedReceiptsGoogleTokenPagination  `json:"tokenPagination"`
-	VoidedPurchases []ListVoidedReceiptsGoogleVoidedPurchase `json:"voidedPurchases"`
-}
-
-type ListVoidedReceiptsGooglePageInfo struct {
-	TotalResults  int `json:"totalResults"`
-	ResultPerPage int `json:"resultPerPage"`
-	StartIndex    int `json:"startIndex"`
-}
-
-type ListVoidedReceiptsGoogleTokenPagination struct {
-	NextPageToken     string `json:"nextPageToken"`
-	PreviousPageToken string `json:"previousPageToken"`
-}
-
-type ListVoidedReceiptsGoogleVoidedPurchase struct {
-	Kind               string `json:"kind"`
-	PurchaseToken      string `json:"purchaseToken"`
-	PurchaseTimeMillis string `json:"purchaseTimeMillis"`
-	VoidedTimeMillis   string `json:"voidedTimeMillis"`
-	OrderId            string `json:"orderId"`
-	VoidedSource       int    `json:"voidedSource"`
-	VoidedReason       int    `json:"voidedReason"`
-}
-
-func listVoidedReceiptsGoogleWithIDs(ctx context.Context, httpc *http.Client, packageName, token string) ([]ListVoidedReceiptsGoogleVoidedPurchase, error) {
-	if len(token) < 1 {
-		return nil, errors.New("'token' must not be empty")
-	}
-
-	voidedPurchases := make([]ListVoidedReceiptsGoogleVoidedPurchase, 0)
-	var nextPageToken string
-	for {
-		var err error
-		var newVoidedPurchases []ListVoidedReceiptsGoogleVoidedPurchase
-		newVoidedPurchases, nextPageToken, err = requestVoidedTransactionsGoogle(ctx, httpc, packageName, token, nextPageToken)
-		if err != nil {
-			return nil, err
-		}
-		voidedPurchases = append(voidedPurchases, newVoidedPurchases...)
-
-		if nextPageToken == "" {
-			break
-		}
-	}
-
-	return voidedPurchases, nil
-}
-
-func requestVoidedTransactionsGoogle(ctx context.Context, httpc *http.Client, packageName, token, nextPageToken string) ([]ListVoidedReceiptsGoogleVoidedPurchase, string, error) {
-	u := &url.URL{
-		Host:     "androidpublisher.googleapis.com",
-		Path:     fmt.Sprintf("androidpublisher/v3/applications/%s/purchases/voidedpurchases", packageName),
-		RawQuery: fmt.Sprintf("access_token=%s&type=1", token),
-		Scheme:   "https",
-	}
-	if nextPageToken != "" {
-		u.RawQuery = fmt.Sprintf("access_token=%s&type=1&pageSelection.token=%s", token, nextPageToken)
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	buf, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	var voidedReceipts []ListVoidedReceiptsGoogleVoidedPurchase
-	var pageToken string
-
-	switch resp.StatusCode {
-	case 200:
-		voidedReceiptsResponse := &listVoidedReceiptsGoogleResponse{}
-		if err = json.Unmarshal(buf, &voidedReceiptsResponse); err != nil {
-			return nil, "", err
-		}
-		if voidedReceiptsResponse.VoidedPurchases != nil {
-			voidedReceipts = voidedReceiptsResponse.VoidedPurchases
-		} else {
-			voidedReceipts = make([]ListVoidedReceiptsGoogleVoidedPurchase, 0)
-		}
-		pageToken = voidedReceiptsResponse.TokenPagination.NextPageToken
-	default:
-		return nil, "", fmt.Errorf("failed to retrieve Google voided purchases - status: %d, payload: %s", resp.StatusCode, string(buf))
-	}
-
-	return voidedReceipts, pageToken, nil
-}
-
 // https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptions#get
 type ValidateSubscriptionReceiptGoogleResponse struct {
-	// TODO: add introductoryPriceInfo, cancelSurveyResult and priceChange fields
 	Kind                        string `json:"kind"`
 	StartTimeMillis             string `json:"startTimeMillis"`
 	ExpiryTimeMillis            string `json:"expiryTimeMillis"`
@@ -622,7 +523,7 @@ type ValidateSubscriptionReceiptGoogleResponse struct {
 }
 
 // Validate an IAP Subscription receipt with the Android Publisher API and the Google credentials.
-func ValidateSubscriptionReceiptGoogle(ctx context.Context, httpc *http.Client, clientEmail string, privateKey string, receipt string) (*ValidateSubscriptionReceiptGoogleResponse, *ReceiptGoogle, []byte, error) {
+func ValidateSubscriptionReceiptGoogle(ctx context.Context, httpc *http.Client, clientEmail string, privateKey string, receipt string) (*runtime.SubscriptionV2GoogleResponse, *ReceiptGoogle, []byte, error) {
 	if len(clientEmail) < 1 {
 		return nil, nil, nil, errors.New("'clientEmail' must not be empty")
 	}
@@ -635,64 +536,132 @@ func ValidateSubscriptionReceiptGoogle(ctx context.Context, httpc *http.Client, 
 		return nil, nil, nil, errors.New("'receipt' must not be empty")
 	}
 
-	token, err := getGoogleAccessToken(ctx, httpc, clientEmail, privateKey)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	return ValidateSubscriptionReceiptGoogleWithIDs(ctx, httpc, token, receipt)
-}
-
-func ValidateSubscriptionReceiptGoogleWithIDs(ctx context.Context, httpc *http.Client, token, receipt string) (*ValidateSubscriptionReceiptGoogleResponse, *ReceiptGoogle, []byte, error) {
-	if len(token) < 1 {
-		return nil, nil, nil, errors.New("'token' must not be empty")
-	}
-
-	if len(receipt) < 1 {
-		return nil, nil, nil, errors.New("'receipt' must not be empty")
-	}
-
 	gr, err := decodeReceiptGoogle(receipt)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	response, buf, err := GetSubscriptionV2Google(ctx, httpc, clientEmail, privateKey, gr.PackageName, gr.PurchaseToken)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return response, gr, buf, nil
+}
+
+func GetPurchaseV2Google(ctx context.Context, httpc *http.Client, clientEmail, privateKey, packageName, purchaseToken string) (*runtime.PurchaseV2GoogleResponse, error) {
+	if len(clientEmail) < 1 {
+		return nil, errors.New("'clientEmail' must not be empty")
+	}
+
+	if len(privateKey) < 1 {
+		return nil, errors.New("'privateKey' must not be empty")
+	}
+
+	if len(purchaseToken) < 1 {
+		return nil, errors.New("'purchaseToken' must not be empty")
+	}
+
+	token, err := getGoogleAccessToken(ctx, httpc, clientEmail, privateKey)
+	if err != nil {
+		return nil, err
+	}
+
 	u := &url.URL{
 		Host:     "androidpublisher.googleapis.com",
-		Path:     fmt.Sprintf("androidpublisher/v3/applications/%s/purchases/subscriptions/%s/tokens/%s", gr.PackageName, gr.ProductID, gr.PurchaseToken),
+		Path:     fmt.Sprintf("androidpublisher/v3/applications/%s/purchases/productsv2/tokens/%s", packageName, purchaseToken),
 		RawQuery: fmt.Sprintf("access_token=%s", token),
 		Scheme:   "https",
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 
 	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	switch resp.StatusCode {
 	case 200:
-		out := &ValidateSubscriptionReceiptGoogleResponse{}
-		out.PurchaseType = -1 // Set sentinel value as this field is omitted in production, and if set to 0 it means the purchase was done in sandbox env
-		if err := json.Unmarshal(buf, &out); err != nil {
-			return nil, nil, nil, err
+		out := &runtime.PurchaseV2GoogleResponse{}
+		if err = json.Unmarshal(buf, &out); err != nil {
+			return nil, err
 		}
 
-		return out, gr, buf, nil
+		return out, nil
 	default:
-		return nil, nil, nil, &ValidationError{
+		return nil, &ValidationError{
+			Err:        ErrNon200ServiceGoogle,
+			StatusCode: resp.StatusCode,
+			Payload:    string(buf),
+		}
+	}
+}
+
+func GetSubscriptionV2Google(ctx context.Context, httpc *http.Client, clientEmail, privateKey, packageName, purchaseToken string) (*runtime.SubscriptionV2GoogleResponse, []byte, error) {
+	if len(clientEmail) < 1 {
+		return nil, nil, errors.New("'clientEmail' must not be empty")
+	}
+
+	if len(privateKey) < 1 {
+		return nil, nil, errors.New("'privateKey' must not be empty")
+	}
+
+	if len(purchaseToken) < 1 {
+		return nil, nil, errors.New("'purchaseToken' must not be empty")
+	}
+
+	token, err := getGoogleAccessToken(ctx, httpc, clientEmail, privateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	u := &url.URL{
+		Host:     "androidpublisher.googleapis.com",
+		Path:     fmt.Sprintf("androidpublisher/v3/applications/%s/purchases/subscriptionsv2/tokens/%s", packageName, purchaseToken),
+		RawQuery: fmt.Sprintf("access_token=%s", token),
+		Scheme:   "https",
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer resp.Body.Close()
+
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch resp.StatusCode {
+	case 200:
+		out := &runtime.SubscriptionV2GoogleResponse{}
+		if err = json.Unmarshal(buf, &out); err != nil {
+			return nil, nil, err
+		}
+
+		return out, buf, nil
+	default:
+		return nil, nil, &ValidationError{
 			Err:        ErrNon200ServiceGoogle,
 			StatusCode: resp.StatusCode,
 			Payload:    string(buf),
@@ -760,7 +729,7 @@ func getHuaweiAccessToken(ctx context.Context, httpc *http.Client, clientID, cli
 	}
 	urlValue := url.Values{"grant_type": {"client_credentials"}, "client_id": {clientID}, "client_secret": {clientSecret}}
 	body := urlValue.Encode()
-	req, err := http.NewRequestWithContext(ctx, "POST", authUrl, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authUrl, strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -839,7 +808,7 @@ func ValidateReceiptHuawei(ctx context.Context, httpc *http.Client, pubKey, clie
 		return nil, nil, nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -892,4 +861,156 @@ func verifySignatureHuawei(base64EncodedPublicKey string, data string, signature
 		return err
 	}
 	return rsa.VerifyPKCS1v15(pub.(*rsa.PublicKey), crypto.SHA256, hashed[:], signatureByte)
+}
+
+type FacebookInstantPaymentInfo struct {
+	Algorithm         string  `json:"algorithm"`
+	AppId             string  `json:"app_id"`
+	IsConsumed        bool    `json:"is_consumed"`
+	IssuedAt          float64 `json:"issued_at"`
+	PaymentActionType string  `json:"payment_action_type"`
+	PaymentId         string  `json:"payment_id"`
+	ProductId         string  `json:"product_id"`
+	PurchasePrice     struct {
+		Amount   string `json:"amount"`
+		Currency string `json:"currency"`
+	} `json:"purchase_price"`
+	PurchaseTime  float64 `json:"purchase_time"`
+	PurchaseToken string  `json:"purchase_token"`
+}
+
+// ValidateReceiptFacebookInstant from: https://developers.facebook.com/docs/games/monetize/in-app-purchases/instant-games#verification
+func ValidateReceiptFacebookInstant(appSecret, signedRequest string) (*FacebookInstantPaymentInfo, string, error) {
+	parts := strings.Split(signedRequest, ".")
+	if len(parts) != 2 {
+		return nil, "", errors.New("invalid signedRequest format")
+	}
+
+	// Decode the first part (SHA256 hash of the payment information)
+	signature, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, "", errors.New("error decoding signedRequest first part:" + err.Error())
+	}
+
+	// Compute the HMAC-SHA256 hash of the payload using the app secret
+	hmacHash := hmac.New(sha256.New, []byte(appSecret))
+	hmacHash.Write([]byte(parts[1]))
+	computedSignature := hmacHash.Sum(nil)
+
+	// Compare the computed signature with the received signature
+	isValid := hmac.Equal(signature, computedSignature)
+
+	if !isValid {
+		return nil, "", errors.New("signedRequest verification failed")
+	}
+
+	// Decode the second part (payment information)
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, "", errors.New("error decoding signedRequest second part:" + err.Error())
+	}
+
+	// Parse the JSON payment information
+	var payment *FacebookInstantPaymentInfo
+	if err := json.Unmarshal(payload, &payment); err != nil {
+		return nil, "", errors.New("error parsing JSON payload:" + err.Error())
+	}
+
+	return payment, string(payload), nil
+}
+
+func ValidateAppleJwsSignature(receipt string) error {
+	jwsTokens := strings.Split(receipt, ".")
+	if len(jwsTokens) != 3 {
+		return fmt.Errorf("invalid jws format: expected 3 parts, got %d", len(jwsTokens))
+	}
+	header := jwsTokens[0]
+	payload := jwsTokens[1]
+	signature := jwsTokens[2]
+
+	headerByte, err := base64.RawURLEncoding.DecodeString(header)
+	if err != nil {
+		return err
+	}
+
+	type Header struct {
+		Alg string   `json:"alg"`
+		X5c []string `json:"x5c"`
+	}
+	var jwsHeader Header
+	if err = json.Unmarshal(headerByte, &jwsHeader); err != nil {
+		return err
+	}
+
+	if len(jwsHeader.X5c) < 3 {
+		return fmt.Errorf("invalid jws header: x5c field must contain at least 3 certificates")
+	}
+
+	certs := make([][]byte, 0)
+	for _, encodedCert := range jwsHeader.X5c {
+		cert, err := base64.StdEncoding.DecodeString(encodedCert)
+		if err != nil {
+			return err
+		}
+		certs = append(certs, cert)
+	}
+
+	rootCert := x509.NewCertPool()
+	ok := rootCert.AppendCertsFromPEM([]byte(AppleRootPEM))
+	if !ok {
+		return errors.New("failed to parse AppleRootPEM")
+	}
+
+	leafCert, err := x509.ParseCertificate(certs[0])
+	if err != nil {
+		return err
+	}
+
+	interCert, err := x509.ParseCertificate(certs[1])
+	if err != nil {
+		return err
+	}
+	intermediates := x509.NewCertPool()
+	intermediates.AddCert(interCert)
+
+	_, err = x509.ParseCertificate(certs[2])
+	if err != nil {
+		return err
+	}
+
+	opts := x509.VerifyOptions{
+		Roots:         rootCert,
+		Intermediates: intermediates,
+	}
+
+	_, err = leafCert.Verify(opts)
+	if err != nil {
+		return err
+	}
+
+	leafCertRsaPubKey, ok := leafCert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("failed to parse leaf certificate public key")
+	}
+
+	signingInput := []byte(fmt.Sprintf("%s.%s", header, payload))
+	hash := sha256.Sum256(signingInput)
+
+	sigBytes, err := base64.RawURLEncoding.DecodeString(signature)
+	if err != nil {
+		return fmt.Errorf("failed to decode jws signature: %w", err)
+	}
+
+	if len(sigBytes) != 64 {
+		return fmt.Errorf("invalid jws signature: invalid length %d, expected 64", len(sigBytes))
+	}
+
+	r := new(big.Int).SetBytes(sigBytes[:32])
+	s := new(big.Int).SetBytes(sigBytes[32:])
+
+	if !ecdsa.Verify(leafCertRsaPubKey, hash[:], r, s) {
+		return errors.New("invalid jws signature: ecdsa verification failed")
+	}
+
+	return nil
 }

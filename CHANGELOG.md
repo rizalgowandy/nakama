@@ -3,14 +3,517 @@ All notable changes to this project are documented below.
 
 The format is based on [keep a changelog](http://keepachangelog.com) and this project uses [semantic versioning](http://semver.org).
 
-## [Unreleased]
+[Unreleased]
+
+### Changed
+- Directory listings on the console port now return an HTTP 404 Not Found error.
+
+## [3.41.0] - 2026-09-18
+### Added
+- Build with Go 1.27.1.
+- Add Console UI to list and query registered Storage Search indices.
+- Add support for namespaced multi fleet manager registration.
+- Expose websocket connection upgrade http headers to session context.
+- Add `Authenticate` module function to authenticate through a registered provider from Go, Lua and JavaScript runtime code. Provider identities are stored in the expanded `user_device` table.
+- Add `RegisterBeforeAuthenticate` and `RegisterAfterAuthenticate` hooks.
+- Add `RegisterBeforeLink` and `RegisterAfterLink` hooks.
+- Add `RegisterBeforeUnlink` and `RegisterAfterUnlink` hooks.
+- Add provider-agnostic authentication: register named authentication providers from the Go runtime, then authenticate, link and unlink those identities through the new `Authenticate`, `Link` and `Unlink` APIs, the matching Go, Lua and JavaScript module functions, and their before/after hooks. Identities are stored in the expanded `user_device` table and listed on the account.
+- Add console support for provider identities: search accounts by one, and unlink one from an account.
+
+### Changed
+- Storage write version rejections now return GRPC error code 9 `FAILED_PRECONDITION` instead of 3 `INVALID_ARGUMENT`. HTTP response code mapping remains the same.
+
+### Fixed
+- Ensure linking a Google ID to an account does not overwrite any existing email.
+- Ensure correct token ID field is used for validating sessions on socket connection.
+- Return well-formed `WWW-Authenticate` header on HTTP 401 Unauthorized responses.
+
+## [3.40.0] - 2026-07-13
+### Added
+- Add Samsung Galaxy Store purchase validation request type and `SAMSUNG_GALAXY_STORE` store provider enum.
+- Add Samsung IAP runtime hooks and `PurchaseValidateSamsung` module function.
+- Add `IAPSamsungConfig` to runtime `GetConfig()` IAP section.
+- Improve logic in Apple JWS receipts validation.
+- Add `console.disable_display_name_search` config option to disable console account search by display name entirely.
+
+### Fixed
+- Fix an issue where group admin account deletion could leave orphaned group edges.
+- Fix In-App Purchase validation persist parameter handling for Apple JWS receipts.
+- Fix race conditions in leaderboard/tournament scheduler which could prevent hooks from triggering under certain conditions.
+
+## [3.39.0] - 2026-05-20
+### Added
+- Add new runtime function to update storage objects with retries.
+
+### Changed
+- Update Satori client to match latest API spec.
+- Add configurable retries to the Satori client.
+
+### Fixed
+- Ignore negative custom runtime counter deltas to avoid panics during metrics collection.
+- Set account empty fields to null appropriately on console account import.
+- Correctly cancel context after matchmaker matched function completes.
+- Fix X-Forwarded-For header handling regression.
+
+## [3.38.0] - 2026-03-20
+### Added
+- Add runtime Satori client feature to delete identities.
+- Add device identifiers as lookup options for runtime account get operations.
+- Add Go runtime function to import an account export snapshot.
+- Add TypeScript/JavaScript runtime function to import an account export snapshot.
+- Add Lua runtime function to import an account export snapshot.
+- Better searching by account display name in the Console UI.
+
+### Changed
+- Better logic for determining client IP addresses from incoming requests.
+- Limit the number of custom metric scopes to prevent adding user identifiers as tags.
+
+### Fixed
+- Correct field usage in voided Google In-App Purchase subscription notifications.
+- Fix an issue where the Storage Index would keep entries which should have been filtered.
+- Fix an issue that could prevent leaderboard/tournament end/reset hooks from firing.
+- Avoid logging unnecessary context cancellation errors on storage operations.
+
+## [3.37.0] - 2026-02-12
+### Added
+- Support Apple JWS receipts in In-App Purchase validation APIs.
+- Expose new Prometheus RPC metrics with label per gRPC status.
+
+### Fixed
+- Fix permission check on Console Group AddMembers operation.
+- Fix Lua runtime random generator seeding.
+
+## [3.36.0] - 2026-01-13
+### Changed
+- Improvements to Console user setup and management.
+- Option for faster cleanup of parties that are idle and empty.
+- Build with Go 1.25.5.
+
+### Fixed
+- Ensure party leader username is recorded on party creation.
+- Ensure ended matches are removed from the Console UI list more quickly.
+- Add In-App Purchase notification type to JS/Lua callback functions.
+
+## [3.35.1] - 2025-12-03
+### Fixed
+- Correctly wire context propagation in Session Start/End runtime event hooks.
+
+## [3.35.0] - 2025-12-02
+### Added
+- New runtime Satori client options for time-based caching.
+- Additional information for transactions in console UI details side panel.
+- Console API status endpoint now returns number of active Parties per node.
+- Console UI status view now displays number of active Parties per node and total.
+- Console API status endpoint now returns the startup time when each node was created.
+- Console UI status view now displays time since each node was started.
+
+### Changed
+- Adjust unit of measure for Satori client timeout.
+- Nakama will not start if attempting to register custom HTTP handlers without a '/' prefix in the path pattern.
+- Nakama will not start if attempting to register custom console HTTP handlers without a '/' prefix in the path pattern.
+- Add runtime Satori client additional filters for live-events listing.
+- Add runtime Satori client live-event join function.
+- Configurable timeout for server initiated socket disconnects graceful close wait period.
+- Fix an issue in the console ACL database schema migration that would prevent it from being applied in CockroachDB.
+- Better display for long transaction identifiers in console UI.
+
+### Fixed
+- Fix migration script to correctly revert console fine-grained access control changes.
+- Avoid unnecessary cache check in runtime Satori client Properties lookup.
+- Fix an issue that would prevent the console data reset operation from completing successfully.
+- Fix an issue with Apple In-App Purchase notification handling that would prevent the notification from being processed.
+- Fix an issue with Google In-App Purchase notification handling that would prevent refund/voided types from being processed.
+- Fix incorrect error message in the console UI when storage import operations actually succeed.
+- Fix incorrect display of ascending/descending leaderboard indicator in console UI.
+- Fix incorrect display of pagination indicators for filtered storage lookups in console UI.
+- Fix issue where disabling tournament ranks might not use the correct timezone for lookups.
+
+## [3.34.1] - 2025-11-12
+### Added
+- Add trace identifier to RPC function contexts.
+- Add runtime Satori client feature to send direct messages.
+- Add runtime Satori client option to fetch messages by a set of identifiers.
+- New TypeScript/JavaScript runtime function to generate secure random bytes.
+- New Lua runtime function to generate secure random bytes.
+
+## [3.34.0] - 2025-11-09
+### Added
+- New Go runtime initializer function to register raw console HTTP handlers.
+
+### Changed
+- Satori client functions now allow filtering by both names and labels.
+
+### Fixed
+- Use correct leaderboard ranks disable hook in the Go runtime.
+- Release database connections faster in notification deletion operations.
+- Release database connections faster when listing console users.
+- Release database connections faster when disabling ranks for leaderboards or tournaments.
+
+## [3.33.1] - 2025-11-03
+### Fixed
+- Fix an issue with Hiro dependencies vendoring.
+- Remove usage of database random generator function in migrations for compatibility with older PostgreSQL versions.
+
+## [3.33.0] - 2025-10-31
+### Added
+- Add Hiro integration to Console UI.
+- Console UI display and interaction with Hiro Inventory.
+- Console UI display and interaction with Hiro Progressions.
+- Add support for importing accounts in Console UI.
+- Add support for exporting and importing storage object values.
+- Expanded support for access controls in Console UI and API.
+- Support for access control templates in Console UI.
+- Console UI integration with Satori, if configuration is present.
+- Allow sending Satori messages directly from the Console UI.
+- Add support for account notes in Console UI.
+- Add support for additional filtering options in Console UI Purchases and Subscriptions views.
+- Add support for additional filtering options in Console UI Wallet Ledger view.
+- Allow sending In-App Notifications from Console UI.
+
+### Fixed
+- Add missing return value in Google In-App Purchase subscription validation.
+
+## [3.32.1] - 2025-10-17
+### Fixed
+- Shorter processing for matchmaker custom function when inactive.
+- Google and Apple In-App Purchase notification handling improvements for subscription upgrade/downgrade events.
+
+## [3.32.0] - 2025-09-16
+### Changed
+- In-App Purchase runtime callback functions now handle other status changes besides refunds.
+- Update In-App Purchase validation internals to use Google Subscriptions v2 API.
+
+## [3.31.0] - 2025-09-02
+### Changed
+- Build with Go 1.25.0.
+
+### Fixed
+- Update Satori client types to match latest API spec.
+- Ensure Console UI loads correctly when served over non-SSL connections.
+- Fix match detail view in Console UI.
+
+### Added
+- Add API response field indicating if join is required for tournaments.
+
+## [3.30.0] - 2025-08-10
+### Added
+- Send In-App Notification for friend removal or friend request rejection.
+
+### Changed
+- Rebuilt console UI on Vue.js and the new Heroic UI components.
+
+## [3.29.0] - 2025-07-29
+### Added
+- New "MatchmakerProcessor" hook to set custom matching behaviour tapping into the complete ticket pool.
+
+### Changed
+- Update Satori client to latest API spec.
+- Process all Apple subscriptions in receipt latest_receipt_info and return the one with higher expiry time.
+
+### Fixed
+- Fix an issue where the leaderboard ranks were sometimes incorrectly calculated when fetching a previous page of records.
+
+## [3.28.0] - 2025-07-14
+### Added
+- Add party listing API and party labeling support.
+- Matchmaker entry create time is now available for custom runtime processing functions.
+
+### Changed
+- New Satori cache flag configuration parameter to require disabling by default.
+- Satori operations no longer carry an unnecessary session identifier.
+- Build with Go 1.24.5.
+
+### Fixed
+- Fix an issue where a purchased Google Subscription would not be looked up by the LinkedPurchaseToken field contained in a notification.
+- Improve Satori caching to prevent incorrect hits.
+- Update tournament size record deletion if it has a maximum size set.
+
+## [3.27.1] - 2025-05-22
+### Changed
+- Minor dependency updates.
+- Decorate request context in authentication after hooks.
+
+## [3.27.0] - 2025-05-12
+### Added
+- Add Satori client API to list Flags Overrides.
+
+### Changed
+- Change Facebook Limited Login validation keys URL.
+- Update Facebook Graph API to v22.
+- Enable Satori FlagsList to return all default flags.
+- Reduce In-App Purchase validation logged errors to debug level.
+- Increase default timeout for Apple In-App Purchase verification.
+- Build with Go 1.24.3.
+
+### Fixed
+- Fix chat message listing pagination issue.
+- Ensure In-App Purchase validation for Google always rejects pending or cancelled receipts.
+- Fix Lua runtime storage index filter registration function.
+- Fix context issue when calling Satori runtime APIs via socket operations.
+- Fix an issue with message timestamp precision in returned channel messages.
+
+## [3.26.0] - 2025-01-25
+### Added
+- Allow account filtering by email in the Console.
+- Add friend metadata support.
+- Add optional caching of Satori client requests.
+
+### Changed
+- Build with Go 1.23.5.
+
+### Fixed
+- Ensure persisted chat messages listing returns correct order.
+- Return correct tournament details in console API leaderboard details endpoint.
+- Do not report invalid http RPC ids to prometheus counts.
+- Fix Lua runtime short day format option.
+- Fix group listing with open and count filters.
+
+## [3.25.0] - 2024-11-25
+### Added
+- Add new runtime function to get a list of user's friend status.
+- Add new Follow/Unfollow runtime APIs.
+- Add new NotificationsUpdate runtime API.
+- Add new initializers function to get config values.
+
+### Changed
+- Increase limit of runtime friend listing operations to 1,000.
+- Leaving a group is now treated as a deletion when done by the last member.
+- Build with Go 1.23.3.
+
+### Fixed
+- Add missing JavaScript runtime SessionRefresh before/after hook functions.
+- Correct text in tournament creation error messages.
+- Improve copying of internal configuration before display to devconsole.
+- Close group channel sooner when group is deleted.
+
+## [3.24.2] - 2024-10-22
+### Fixed
+- Correctly display MFA-related configuration in devconsole UI.
+- Correctly extract RPC function identifiers.
+
+## [3.24.1] - 2024-10-21
+### Changed
+- Build with correct version of Protobuf dependency.
+
+## [3.24.0] - 2024-10-21
+### Added
+- New runtime function to list user notifications.
+- Support for runtime registration of custom HTTP handlers.
+
+### Changed
+- Increased limit on runtimes group users list functions.
+- Added pagination support to storage index listing.
+- Update runtime Satori client for latest API changes.
+- Build with Go 1.23.2.
+
+### Fixed
+- Ensure matchmaker stats behave correctly if matchmaker becomes fully empty and idle.
+- Correctly clear rank cache entries on account deletion.
+- Only display owned purchases in the console account tab.
+- Correctly infer X-Forwarded-For headers on Satori Authenticate calls in JS/Lua runtimes.
+
+## [3.23.0] - 2024-07-27
+### Added
+- Add devconsole view to list and search purchases across users.
+- Add devconsole view to list and search subscriptions across users.
+- Add function to get notifications by identifier to Go runtime.
+- Add function to get notifications by identifier to Lua runtime.
+- Add function to get notifications by identifier to TypeScript/JavaScript runtime.
+- Add function to delete notifications by identifier to Go runtime.
+- Add function to delete notifications by identifier to Lua runtime.
+- Add function to delete notifications by identifier to TypeScript/JavaScript runtime.
+- Add runtime function to disable ranks for an active leaderboard.
+- Add new matchmaker stats API.
+- Add support for specifying session vars in devconsole API explorer calls.
+
+### Changed
+- Add leaderboard create function parameter to enable or disable ranks.
+- Add tournament create function parameter to enable or disable ranks.
+- Obfuscate further fields when viewing server configuration in the devconsole.
+- Build with Go 1.22.5.
+
+### Fixed
+- Correctly wire Go runtime shutdown function context.
+- Fix friends of friends API error when user has no friends.
+- Fix group listing pagination if name filter is used.
+- Correctly register friends of friends API before/after hooks.
+
+## [3.22.0] - 2024-06-09
+### Added
+- Add runtime support for registering a shutdown hook function.
+- Add support to custom sorting in storage index search.
+- New config option to enforce a single party per user socket.
+- New config option to enforce a single valid session token per user.
+- New friends of friends listing API and runtime functions.
+
+### Changed
+- When a user is blocked, any DM streams between the blocker and blocked user are torn down.
+- Add confirm dialog to devconsole delete operations.
+- Reduce Console Storage View memory usage.
+- Upgraded pgx to v5.
+- Attempt to import Facebook friends on Limited Login authentication.
+- Build with Go 1.22.4.
+- Improve devconsole login page experience.
+- Return Lua VM instance to the pool only after any error processing is complete.
+- Better cancellation of long running queries in devconsole operations.
+
+### Fixed
+- Ensure Apple receipts with duplicate transaction identifiers are processed cleanly.
+- Fix leaderboard rank cache initialization upon startup.
+- Fix log message incorrectly referencing "userID" instead of "senderID".
+- Fix Lua runtime calls to string metatable functions.
+- Correctly handle Steam API rejections on friend listing operations.
+- Ensure Google auth token errors are handled gracefully.
+
+## [3.21.1] - 2024-03-22
+### Added
+- Add ability to easily run unit and integration tests in an isolated docker-compose environment.
+
+### Changed
+- More efficient initial loading of storage index contents.
+
+### Fixed
+- Fix issue with Fleet Manager access causing an unexpected error.
+
+## [3.21.0] - 2024-03-17
+### Added
+- Add Fleet Manager API to power session-based multiplayer integrations. See [the documentation](https://heroiclabs.com/docs/nakama/concepts/multiplayer/session-based/) for more details.
+- Add CRON next and previous functions to Go runtime.
+- Add CRON previous function to Lua runtime.
+- Add CRON previous function to TypeScript/JavaScript runtime.
+- Add support for storage deletes in runtime multi-update functions.
+
+### Changed
+- Reduce number of memory allocations in leaderboard cache.
+- Fix leaderboard rank cache inconsistencies/race that could arise under heavy load.
+- List leaderboard records can now return up to 1,000 records per request.
+- Simplify query planning for storage object read operations.
+- Improve comparison operation for leaderboard rank cache ordering.
+- Extend extraction of purchase data from Apple IAP receipts.
+
+### Fixed
+- Prevent players from requesting duplicate joins to the same party.
+- Prevent players from requesting joins to parties they are already members of.
+- Ensure runtime user deletion function rejects the system user.
+
+## [3.20.1] - 2024-02-03
+### Changed
+- Improve handling of messages being sent while session is closing.
+- Build with Go 1.21.6.
+
+### Fixed
+- Skip Google refund handling for deleted users.
+- Fix storage engine version check regression.
+- Fix JavaScript runtime tournament records list owner identifier parameter handling.
+- Fix regression in tournament end active time calculation when it coincides with reset schedule.
+- Better handling of concurrent wallet update operations for the same user.
+
+## [3.20.0] - 2023-12-15
+### Changed
+- JavaScript runtime `localcachePut` now only accepts primitive types, other values will throw an error.
+- Storage search index list max limit increased from 100 to 10,000 results.
+- Upgrade GRPC-Gateway, Tally, Zap, crypto, oauth2, GRPC, and related dependencies.
+- Build with Go 1.21.5.
+
+### Fixed
+- Fix pointer slices assertions in JavaScript runtime Nakama module function arguments.
+- Fix caller ID parameter index in Lua runtime `storage_list` function.
+- Fix incorrect GOARCH flag in Dockerfiles for arm64.
+
+## [3.19.0] - 2023-11-11
+### Added
+- Add IAP purchase validation support for Facebook Instant Games.
+- Add Lua runtime function to clear all localcache data.
+- Add JavaScript runtime function to clear all localcache data.
+- Add support for per-key TTL in Lua runtime localcache.
+- Add support for per-key TTL in JavaScript runtime localcache.
+- Add support for optional client IP address passthrough to runtime Satori client.
+
+### Changed
+- Remove unused config 'matchmaker.batch_pool_size'.
+- RPC now allows omitting the `unwrap` parameter for requests with empty payloads.
+- Upgrade GRPC dependency.
+- Writing tournament scores now updates number of scores even if submitted score is not an improvement.
+- Move internal queries with variable number of args to a fixed number of args syntax.
+- Better handling of `num_score` and `max_num_score` in tournament score updates.
+- Remove unnecessary `curl`, `git`, `unzip`, `rsync`, and `schroot` tools from Docker images.
+- Build with Go 1.21.4 and use Debian bookworm-slim for base docker images.
+
+### Fixed
+- Correctly handle empty email field when authenticating via Apple Sign In.
+- Fix issue where rank cache may store duplicate ranks for some score inputs.
+- Fix issue related to accepting party members.
+- Fix HTTP request timeout usage in JavaScript runtime.
+
+## [3.18.0] - 2023-10-24
+### Added
+- Allow HTTP key to be read from an HTTP request's Basic auth header if present.
+- Add prefix search for storage keys in console (`key%`).
+- Runtime functions to build a leaderboardList cursor to start listing from a given rank.
+- Improved support for TypeScript/JavaScript runtime profiling.
+
+### Changed
+- Session cache model switched from whitelist to blacklist for improved usability.
+- Use Steam partner API instead of public API for Steam profiles and friends requests.
+- Add create_time and update_time to returned storage engine writes acks.
+- Add storage index create flag to read only from the index.
+- Add caller ID param to storage listing and storage index listing runtime APIs.
+- Update Facebook Graph API usage from v11 to v18.
+- Add support for refresh token rotation.
+- Allow JS runtime storage write operation version inputs to be undefined.
+- Build with Go 1.21.3.
+
+### Fixed
+- Fixed multiple issues found by linter.
+- Fix storage index listing results sometimes being returned with incorrect order.
+- Fixes calculation of leaderboard and tournament times for rare types of CRON expressions that don't execute at a fixed interval.
+- Improved how start and end times are calculated for tournaments occurring in the future.
+- Fix users receiving friend request notifications when added by users who have blocked them.
+- Fix Go runtime registration of matchmaker custom override hook function.
+- Fully remove corresponding matchmaker tickets after custom matchmaker process completes.
+- Fix incorrectly documented default value for matchmaker flag.
+
+### [3.17.1] - 2023-08-23
+### Added
+- Add Satori `recompute` optional input parameter to relevant operations.
+
+### Changed
+- Prefix storage index values with `value.` for query input namespacing purposes.
+
+### Fixed
+- Ensure graceful log handling during Lua runtime check operation.
+- Fix Satori client response body resource handling.
+
+## [3.17.0] - 2023-07-19
+### Added
+- Introduce pagination for console API leaderboard and tournament listing endpoint.
+- Introduce pagination for devconsole leaderboard view.
+- Add storage object indexing support and related runtime functions.
+- Return rank count from leaderboard score listings, if available for the given leaderboard.
+- Return rank count from tournament score listings, if available for the given tournament.
+
 ### Changed
 - Better formatting for graphed values in devconsole status view.
+- Better handling of large numbers of configured leaderboards and tournaments.
+- Improved delivery of non-persistent SendAll notifications to large numbers of users.
+- Truncate stats reported to devconsole status view to 2 decimal digits for improved readability.
+- Memory usage and population time improvements in leaderboard rank cache.
+- Better handling of internal transaction retries.
+- Better handling of party membership when interacting with matchmaking.
+- Improve leaderboard cache reporting of idempotent operations.
+- Build with Go 1.20.6.
 
 ### Fixed
 - Correct cursor usage in group listings using only open/closed group state filter.
-- Remap original Google IDs to "next generation player IDs".
 - Fix issue delivering persistent SendAll notifications to large numbers of users.
+- Remove incorrect category start and category end parameters from runtime leaderboard list functions.
+- Graceful handling of idempotent tournament creation operations.
+- Correct sorting of batched storage write and delete operations.
+- Fix indexing of channel message list responses in Lua runtime.
+- Better handling of parameters submitted from the devconsole UI.
+- Remap original Google IDs to "next generation player IDs"
+- Return ordered owner records in leaderboard/tournament records listings.
 
 ## [3.16.0] - 2023-04-18
 ### Added
@@ -1340,4 +1843,3 @@ This release brings a large number of changes and new features to the server. It
 ## [0.10.0] - 2017-01-14
 ### Added
 - Initial public release.
-

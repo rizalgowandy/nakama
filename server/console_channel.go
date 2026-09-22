@@ -2,23 +2,22 @@ package server
 
 import (
 	"context"
-	sql "database/sql"
-	"github.com/gofrs/uuid"
+	"database/sql"
+	"net/url"
+	"sort"
+	"time"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"net/url"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
 )
 
 func (s *ConsoleServer) ListChannelMessages(ctx context.Context, in *console.ListChannelMessagesRequest) (*api.ChannelMessageList, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	const limit = 50
 
 	stream, err := buildStream(in)
@@ -36,7 +35,7 @@ func (s *ConsoleServer) ListChannelMessages(ctx context.Context, in *console.Lis
 		return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
 	}
 
-	messageList, err := ChannelMessagesList(ctx, s.logger, s.db, uuid.Nil, *stream, channelId, limit, false, cursor)
+	messageList, err := ChannelMessagesList(ctx, logger, s.db, uuid.Nil, *stream, channelId, limit, false, cursor)
 	if err == runtime.ErrChannelCursorInvalid {
 		return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
 	} else if err != nil {
@@ -47,6 +46,7 @@ func (s *ConsoleServer) ListChannelMessages(ctx context.Context, in *console.Lis
 }
 
 func (s *ConsoleServer) DeleteChannelMessages(ctx context.Context, in *console.DeleteChannelMessagesRequest) (*console.DeleteChannelMessagesResponse, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	var affected int64
 	if in.Before != nil {
 		query := "DELETE FROM message WHERE create_time < $1::TIMESTAMPTZ"
@@ -54,41 +54,37 @@ func (s *ConsoleServer) DeleteChannelMessages(ctx context.Context, in *console.D
 
 		var res sql.Result
 		var err error
-		if res, err = s.db.ExecContext(ctx, query, &pgtype.Timestamptz{Time: deleteBefore, Status: pgtype.Present}); err != nil {
-			s.logger.Error("Could not delete messages.", zap.Error(err))
+		if res, err = s.db.ExecContext(ctx, query, deleteBefore); err != nil {
+			logger.Error("Could not delete messages.", zap.Error(err))
 			return nil, status.Error(codes.Internal, "An error occurred while trying to delete messages.")
 		}
 		affected, err = res.RowsAffected()
 		if err != nil {
-			s.logger.Error("Could not count deleted messages.", zap.Error(err))
+			logger.Error("Could not count deleted messages.", zap.Error(err))
 		}
-		s.logger.Info("Messages deleted.", zap.Int64("affected", affected), zap.String("timestamp", deleteBefore.String()))
+		logger.Info("Messages deleted.", zap.Int64("affected", affected), zap.String("timestamp", deleteBefore.String()))
 	}
 	if len(in.Ids) > 0 {
-		params := make([]interface{}, 0, len(in.Ids))
-		statements := make([]string, len(in.Ids))
-		for i, id := range in.Ids {
-			idStr, err := uuid.FromString(id)
+		for _, id := range in.Ids {
+			_, err := uuid.FromString(id)
 			if err != nil {
 				return nil, status.Error(codes.InvalidArgument, "Requires a valid message ID.")
 			}
-			params = append(params, idStr)
-			statements[i] = "$" + strconv.Itoa(i+1)
 		}
-		query := "DELETE FROM message WHERE id IN (" + strings.Join(statements, ",") + ")"
+		query := "DELETE FROM message WHERE id = ANY($1)"
 		var res sql.Result
 		var err error
-		if res, err = s.db.ExecContext(ctx, query, params...); err != nil {
-			s.logger.Error("Could not delete messages.", zap.Error(err))
+		if res, err = s.db.ExecContext(ctx, query, in.Ids); err != nil {
+			logger.Error("Could not delete messages.", zap.Error(err))
 			return nil, status.Error(codes.Internal, "An error occurred while trying to delete messages.")
 		}
 		batch, err := res.RowsAffected()
 		if err != nil {
-			s.logger.Error("Could not count deleted messages.", zap.Error(err))
+			logger.Error("Could not count deleted messages.", zap.Error(err))
 		}
 		affected = affected + batch
 
-		s.logger.Info("Messages batch deleted.", zap.Int64("size", batch))
+		logger.Info("Messages batch deleted.", zap.Int64("size", batch))
 	}
 
 	return &console.DeleteChannelMessagesResponse{Total: affected}, nil

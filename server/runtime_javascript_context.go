@@ -39,42 +39,46 @@ const (
 	__RUNTIME_JAVASCRIPT_CTX_MATCH_NODE       = "matchNode"
 	__RUNTIME_JAVASCRIPT_CTX_MATCH_LABEL      = "matchLabel"
 	__RUNTIME_JAVASCRIPT_CTX_MATCH_TICK_RATE  = "matchTickRate"
+	__RUNTIME_JAVASCRIPT_CTX_TRACE_ID         = "traceId"
 )
 
-func NewRuntimeJsContext(r *goja.Runtime, node, version string, env goja.Value, mode RuntimeExecutionMode, httpHeaders, queryParams map[string][]string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort, lang string) *goja.Object {
+func NewRuntimeJsContext(r *goja.Runtime, node, version string, env goja.Value, mode RuntimeExecutionMode, httpHeaders, queryParams map[string][]string, traceID string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort, lang string) *goja.Object {
 	ctxObj := r.NewObject()
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_NODE, node)
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_VERSION, version)
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_ENV, env)
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_MODE, mode.String())
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_NODE, node)
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_VERSION, version)
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_ENV, env)
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_MODE, mode.String())
 	if httpHeaders != nil {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_HTTP_HEADERS, httpHeaders)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_HTTP_HEADERS, httpHeaders)
 	}
 	if queryParams != nil {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_QUERY_PARAMS, queryParams)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_QUERY_PARAMS, queryParams)
 	}
 	if sessionExpiry != 0 {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_USER_SESSION_EXP, sessionExpiry)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_USER_SESSION_EXP, sessionExpiry)
 	}
 	if userID != "" {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_USER_ID, userID)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_USER_ID, userID)
 	}
 	if username != "" {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_USERNAME, username)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_USERNAME, username)
 	}
 	if vars != nil {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_VARS, vars)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_VARS, vars)
 	}
 	if sessionID != "" {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_SESSION_ID, sessionID)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_SESSION_ID, sessionID)
 		// Lang is never reported without session ID.
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_LANG, lang)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_LANG, lang)
 	}
 	if clientIP != "" {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_CLIENT_IP, clientIP)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_CLIENT_IP, clientIP)
 	}
 	if clientPort != "" {
-		ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_CLIENT_PORT, clientPort)
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_CLIENT_PORT, clientPort)
+	}
+	if traceID != "" {
+		_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_TRACE_ID, traceID)
 	}
 
 	return ctxObj
@@ -82,23 +86,23 @@ func NewRuntimeJsContext(r *goja.Runtime, node, version string, env goja.Value, 
 
 func NewRuntimeJsInitContext(r *goja.Runtime, node, version string, env map[string]string) *goja.Object {
 	ctxObj := r.NewObject()
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_NODE, node)
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_VERSION, version)
-	ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_ENV, env)
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_NODE, node)
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_VERSION, version)
+	_ = ctxObj.Set(__RUNTIME_JAVASCRIPT_CTX_ENV, env)
 
 	return ctxObj
 }
 
-func RuntimeJsConvertJsValue(jv interface{}) interface{} {
+func RuntimeJsConvertJsValue(jv any) any {
 	switch v := jv.(type) {
-	case map[string]interface{}:
-		newMap := make(map[string]interface{}, len(v))
+	case map[string]any:
+		newMap := make(map[string]any, len(v))
 		for mapKey, mapValue := range v {
 			newMap[mapKey] = RuntimeJsConvertJsValue(mapValue)
 		}
 		return newMap
-	case []interface{}:
-		newSlice := make([]interface{}, len(v))
+	case []any:
+		newSlice := make([]any, len(v))
 		for i, sliceValue := range v {
 			newSlice[i] = RuntimeJsConvertJsValue(sliceValue)
 		}

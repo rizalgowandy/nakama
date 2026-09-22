@@ -40,7 +40,7 @@ type LValue interface {
 // LVIsFalse returns true if a given LValue is a nil or false otherwise false.
 func LVIsFalse(v LValue) bool { return v == LNil || v == LFalse }
 
-// LVIsFalse returns false if a given LValue is a nil or false otherwise true.
+// LVAsBool returns false if a given LValue is a nil or false otherwise true.
 func LVAsBool(v LValue) bool { return v != LNil && v != LFalse }
 
 // LVAsString returns string representation of a given LValue
@@ -228,7 +228,7 @@ func (ls *LState) assertString() (string, bool)       { return "", false }
 func (ls *LState) assertFunction() (*LFunction, bool) { return nil, false }
 
 type LUserData struct {
-	Value     interface{}
+	Value     any
 	Env       *LTable
 	Metatable LValue
 }

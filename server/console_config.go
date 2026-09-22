@@ -31,18 +31,21 @@ import (
 const ObfuscationString = "REDACTED"
 
 func (s *ConsoleServer) GetConfig(ctx context.Context, in *emptypb.Empty) (*console.Config, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	cfg, err := s.config.Clone()
 	if err != nil {
-		s.logger.Error("Error cloning config.", zap.Error(err))
+		logger.Error("Error cloning config.", zap.Error(err))
 		return nil, status.Error(codes.Internal, "Error processing config.")
 	}
+
+	cfg.GetConsole().SigningKey = ObfuscationString
 
 	cfg.GetConsole().Password = ObfuscationString
 	for i, address := range cfg.GetDatabase().Addresses {
 		rawURL := fmt.Sprintf("postgresql://%s", address)
 		parsedURL, err := url.Parse(rawURL)
 		if err != nil {
-			s.logger.Error("Error parsing database address in config.", zap.Error(err))
+			logger.Error("Error parsing database address in config.", zap.Error(err))
 			return nil, status.Error(codes.Internal, "Error processing config.")
 		}
 		if parsedURL.User != nil {
@@ -52,12 +55,31 @@ func (s *ConsoleServer) GetConfig(ctx context.Context, in *emptypb.Empty) (*cons
 		}
 	}
 
-	cfg.GetGoogleAuth().CredentialsJSON = ObfuscationString
-	cfg.GetGoogleAuth().OAuthConfig = nil
+	if cfg.GetGoogleAuth().CredentialsJSON != "" {
+		cfg.GetGoogleAuth().CredentialsJSON = ObfuscationString
+		cfg.GetGoogleAuth().OAuthConfig = nil
+	}
+
+	if cfg.GetIAP().Google.PrivateKey != "" {
+		cfg.GetIAP().Google.PrivateKey = ObfuscationString
+	}
+	if cfg.GetIAP().Apple.SharedPassword != "" {
+		cfg.GetIAP().Apple.SharedPassword = ObfuscationString
+	}
+	if cfg.GetIAP().Huawei.ClientSecret != "" {
+		cfg.GetIAP().Huawei.ClientSecret = ObfuscationString
+	}
+
+	if cfg.GetSocial().FacebookInstantGame.AppSecret != "" {
+		cfg.GetSocial().FacebookInstantGame.AppSecret = ObfuscationString
+	}
+	if cfg.GetIAP().FacebookInstant.AppSecret != "" {
+		cfg.GetIAP().FacebookInstant.AppSecret = ObfuscationString
+	}
 
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
-		s.logger.Error("Error encoding config.", zap.Error(err))
+		logger.Error("Error encoding config.", zap.Error(err))
 		return nil, status.Error(codes.Internal, "Error processing config.")
 	}
 
@@ -77,10 +99,11 @@ func (s *ConsoleServer) GetConfig(ctx context.Context, in *emptypb.Empty) (*cons
 }
 
 func (s *ConsoleServer) DeleteAllData(ctx context.Context, in *emptypb.Empty) (*emptypb.Empty, error) {
+	logger, _ := LoggerWithTraceId(ctx, s.logger)
 	query := `TRUNCATE TABLE users, user_edge, user_device, user_tombstone, wallet_ledger, storage, purchase,
-			subscription, notification, message, leaderboard, leaderboard_record, groups, group_edge`
+			subscription, notification, message, leaderboard, leaderboard_record, groups, group_edge, users_notes`
 	if _, err := s.db.ExecContext(ctx, query); err != nil {
-		s.logger.Debug("Could not cleanup data.", zap.Error(err))
+		logger.Debug("Could not cleanup data.", zap.Error(err))
 		return nil, status.Error(codes.Internal, "An error occurred while trying to truncate tables.")
 	}
 	// Setup System user
@@ -88,9 +111,9 @@ func (s *ConsoleServer) DeleteAllData(ctx context.Context, in *emptypb.Empty) (*
     VALUES ('00000000-0000-0000-0000-000000000000', '')
     ON CONFLICT(id) DO NOTHING`
 	if _, err := s.db.ExecContext(ctx, query); err != nil {
-		s.logger.Debug("Error creating system user.", zap.Error(err))
+		logger.Debug("Error creating system user.", zap.Error(err))
 		return nil, status.Error(codes.Internal, "An error occurred while trying to setup the system user.")
 	}
-	s.logger.Info("All data cleaned up.")
+	logger.Info("All data cleaned up.")
 	return &emptypb.Empty{}, nil
 }

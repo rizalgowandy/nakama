@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/gorilla/websocket"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -40,6 +40,7 @@ type sessionWS struct {
 	config     Config
 	id         uuid.UUID
 	format     SessionFormat
+	headers    map[string][]string
 	userID     uuid.UUID
 	username   *atomic.String
 	vars       map[string]string
@@ -57,9 +58,10 @@ type sessionWS struct {
 	pingPeriodDuration   time.Duration
 	pongWaitDuration     time.Duration
 	writeWaitDuration    time.Duration
+	closeAckWaitDuration time.Duration
 
 	sessionRegistry SessionRegistry
-	statusRegistry  *StatusRegistry
+	statusRegistry  StatusRegistry
 	matchmaker      Matchmaker
 	tracker         Tracker
 	metrics         Metrics
@@ -67,19 +69,23 @@ type sessionWS struct {
 	runtime         *Runtime
 
 	stopped                bool
+	closeSentCAS           *atomic.Uint32
+	closeWaitCh            chan struct{}
 	conn                   *websocket.Conn
 	receivedMessageCounter int
 	pingTimer              *time.Timer
 	pingTimerCAS           *atomic.Uint32
 	outgoingCh             chan []byte
+	closeMu                sync.Mutex
 }
 
-func NewSessionWS(logger *zap.Logger, config Config, format SessionFormat, sessionID, userID uuid.UUID, username string, vars map[string]string, expiry int64, clientIP, clientPort, lang string, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, conn *websocket.Conn, sessionRegistry SessionRegistry, statusRegistry *StatusRegistry, matchmaker Matchmaker, tracker Tracker, metrics Metrics, pipeline *Pipeline, runtime *Runtime) Session {
+func NewSessionWS(logger *zap.Logger, config Config, format SessionFormat, sessionID, userID uuid.UUID, username, tokenId string, headers map[string][]string, vars map[string]string, tokenExpiry, tokenIssuedAt int64, clientIP, clientPort, lang string, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, conn *websocket.Conn, sessionRegistry SessionRegistry, statusRegistry StatusRegistry, matchmaker Matchmaker, tracker Tracker, metrics Metrics, pipeline *Pipeline, runtime *Runtime) Session {
 	sessionLogger := logger.With(zap.String("uid", userID.String()), zap.String("sid", sessionID.String()))
 
 	sessionLogger.Info("New WebSocket session connected", zap.Uint8("format", uint8(format)))
 
 	ctx, ctxCancelFn := context.WithCancel(context.Background())
+	ctx = populateCtx(ctx, userID, username, tokenId, vars, tokenExpiry, tokenIssuedAt)
 
 	wsMessageType := websocket.TextMessage
 	if format == SessionFormatProtobuf {
@@ -91,10 +97,11 @@ func NewSessionWS(logger *zap.Logger, config Config, format SessionFormat, sessi
 		config:     config,
 		id:         sessionID,
 		format:     format,
+		headers:    headers,
 		userID:     userID,
 		username:   atomic.NewString(username),
 		vars:       vars,
-		expiry:     expiry,
+		expiry:     tokenExpiry,
 		clientIP:   clientIP,
 		clientPort: clientPort,
 		lang:       lang,
@@ -108,6 +115,7 @@ func NewSessionWS(logger *zap.Logger, config Config, format SessionFormat, sessi
 		pingPeriodDuration:   time.Duration(config.GetSocket().PingPeriodMs) * time.Millisecond,
 		pongWaitDuration:     time.Duration(config.GetSocket().PongWaitMs) * time.Millisecond,
 		writeWaitDuration:    time.Duration(config.GetSocket().WriteWaitMs) * time.Millisecond,
+		closeAckWaitDuration: time.Duration(config.GetSocket().CloseAckWaitMs) * time.Millisecond,
 
 		sessionRegistry: sessionRegistry,
 		statusRegistry:  statusRegistry,
@@ -118,6 +126,8 @@ func NewSessionWS(logger *zap.Logger, config Config, format SessionFormat, sessi
 		runtime:         runtime,
 
 		stopped:                false,
+		closeSentCAS:           atomic.NewUint32(0),
+		closeWaitCh:            make(chan struct{}),
 		conn:                   conn,
 		receivedMessageCounter: config.GetSocket().PingBackoffThreshold,
 		pingTimer:              time.NewTimer(time.Duration(config.GetSocket().PingPeriodMs) * time.Millisecond),
@@ -166,6 +176,10 @@ func (s *sessionWS) Vars() map[string]string {
 	return s.vars
 }
 
+func (s *sessionWS) Headers() map[string][]string {
+	return s.headers
+}
+
 func (s *sessionWS) Expiry() int64 {
 	return s.expiry
 }
@@ -173,7 +187,7 @@ func (s *sessionWS) Expiry() int64 {
 func (s *sessionWS) Consume() {
 	// Fire an event for session start.
 	if fn := s.runtime.EventSessionStart(); fn != nil {
-		fn(s.userID.String(), s.username.Load(), s.vars, s.expiry, s.id.String(), s.clientIP, s.clientPort, s.lang, time.Now().UTC().Unix())
+		fn(s.ctx, s.userID.String(), s.username.Load(), s.headers, s.vars, s.expiry, s.id.String(), s.clientIP, s.clientPort, s.lang, time.Now().UTC().Unix())
 	}
 
 	s.conn.SetReadLimit(s.config.GetSocket().MaxMessageSizeBytes)
@@ -184,6 +198,15 @@ func (s *sessionWS) Consume() {
 	}
 	s.conn.SetPongHandler(func(string) error {
 		s.maybeResetPingTimer()
+		return nil
+	})
+	s.conn.SetCloseHandler(func(code int, text string) error {
+		if s.closeSentCAS.CompareAndSwap(0, 1) {
+			message := websocket.FormatCloseMessage(code, "")
+			_ = s.conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(s.pongWaitDuration))
+		} else {
+			close(s.closeWaitCh)
+		}
 		return nil
 	})
 
@@ -200,13 +223,15 @@ IncomingLoop:
 			// Ignore "normal" WebSocket errors.
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
 				// Ignore underlying connection being shut down while read is waiting for data.
-				if e, ok := err.(*net.OpError); !ok || e.Err.Error() != "use of closed network connection" {
+				var opErr *net.OpError
+				if !errors.As(err, &opErr) || opErr.Error() != net.ErrClosed.Error() {
 					s.logger.Debug("Error reading message from client", zap.Error(err))
 					reason = err.Error()
 				}
 			}
 			break
 		}
+
 		if messageType != s.wsMessageType {
 			// Expected text but received binary, or expected binary but received text.
 			// Disconnect client if it attempts to use this kind of mixed protocol mode.
@@ -400,29 +425,35 @@ func (s *sessionWS) Send(envelope *rtapi.Envelope, reliable bool) error {
 }
 
 func (s *sessionWS) SendBytes(payload []byte, reliable bool) error {
-	s.Lock()
-	if s.stopped {
-		s.Unlock()
-		return nil
-	}
-
 	// Attempt to queue messages and observe failures.
 	select {
 	case s.outgoingCh <- payload:
-		s.Unlock()
 		return nil
 	default:
 		// The outgoing queue is full, likely because the remote client can't keep up.
 		// Terminate the connection immediately because the only alternative that doesn't block the server is
 		// to start dropping messages, which might cause unexpected behaviour.
-		s.Unlock()
 		s.logger.Warn("Could not write message, session outgoing queue full")
-		s.Close(ErrSessionQueueFull.Error(), runtime.PresenceReasonDisconnect)
+		// Close in a goroutine as the method can block
+		go s.Close(ErrSessionQueueFull.Error(), runtime.PresenceReasonDisconnect)
 		return ErrSessionQueueFull
 	}
 }
 
+func (s *sessionWS) CloseLock() {
+	s.closeMu.Lock()
+}
+
+func (s *sessionWS) CloseUnlock() {
+	s.closeMu.Unlock()
+}
+
 func (s *sessionWS) Close(msg string, reason runtime.PresenceReason, envelopes ...*rtapi.Envelope) {
+	s.CloseLock()
+	// Cancel any ongoing operations tied to this session.
+	s.ctxCancelFn()
+	s.CloseUnlock()
+
 	s.Lock()
 	if s.stopped {
 		s.Unlock()
@@ -430,9 +461,6 @@ func (s *sessionWS) Close(msg string, reason runtime.PresenceReason, envelopes .
 	}
 	s.stopped = true
 	s.Unlock()
-
-	// Cancel any ongoing operations tied to this session.
-	s.ctxCancelFn()
 
 	if s.logger.Core().Enabled(zap.DebugLevel) {
 		s.logger.Info("Cleaning up closed client connection")
@@ -460,7 +488,6 @@ func (s *sessionWS) Close(msg string, reason runtime.PresenceReason, envelopes .
 
 	// Clean up internals.
 	s.pingTimer.Stop()
-	close(s.outgoingCh)
 
 	// Send final messages, if any are specified.
 	for _, envelope := range envelopes {
@@ -504,20 +531,39 @@ func (s *sessionWS) Close(msg string, reason runtime.PresenceReason, envelopes .
 		s.Unlock()
 	}
 
-	// Send close message.
-	if err := s.conn.WriteControl(websocket.CloseMessage, []byte{}, time.Now().Add(s.writeWaitDuration)); err != nil {
-		// This may not be possible if the socket was already fully closed by an error.
-		s.logger.Debug("Could not send close message", zap.Error(err))
+	if msg != "" {
+		if s.closeSentCAS.CompareAndSwap(0, 1) {
+			// Server initiated close, attempt to send a close control message.
+			reasonMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, msg)
+			if err := s.conn.WriteControl(websocket.CloseMessage, reasonMsg, time.Now().Add(s.writeWaitDuration)); err != nil {
+				// This may not be possible if the socket was already fully closed by an error.
+				s.logger.Debug("Could not send close message", zap.Error(err))
+			} else {
+				t := time.NewTimer(s.closeAckWaitDuration)
+				defer t.Stop()
+				select {
+				case <-s.closeWaitCh:
+					s.logger.Debug("socket close ack received")
+				case <-t.C:
+					s.logger.Debug("socket close ack not received within 10 seconds")
+				}
+			}
+		}
 	}
+
 	// Close WebSocket.
 	if err := s.conn.Close(); err != nil {
 		s.logger.Debug("Could not close", zap.Error(err))
 	}
 
-	s.logger.Info("Closed client connection")
+	if msg != "" {
+		s.logger.Debug("Closed client connection", zap.String("reason", msg))
+	} else {
+		s.logger.Debug("Closed client connection")
+	}
 
 	// Fire an event for session end.
 	if fn := s.runtime.EventSessionEnd(); fn != nil {
-		fn(s.userID.String(), s.username.Load(), s.vars, s.expiry, s.id.String(), s.clientIP, s.clientPort, s.lang, time.Now().UTC().Unix(), msg)
+		fn(s.ctx, s.userID.String(), s.username.Load(), s.headers, s.vars, s.expiry, s.id.String(), s.clientIP, s.clientPort, s.lang, time.Now().UTC().Unix(), msg)
 	}
 }

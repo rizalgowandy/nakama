@@ -17,16 +17,17 @@ package server
 import (
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchmaker Matchmaker, tracker Tracker, metrics Metrics, runtime *Runtime, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, pipeline *Pipeline) func(http.ResponseWriter, *http.Request) {
+func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchmaker Matchmaker, tracker Tracker, metrics Metrics, runtime *Runtime, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, pipeline *Pipeline) func(http.ResponseWriter, *http.Request) {
 	upgrader := &websocket.Upgrader{
 		ReadBufferSize:  config.GetSocket().ReadBufferSizeBytes,
 		WriteBufferSize: config.GetSocket().WriteBufferSizeBytes,
@@ -43,12 +44,10 @@ func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry Sess
 		// Check format.
 		var format SessionFormat
 		switch r.URL.Query().Get("format") {
+		case "", "json":
+			format = SessionFormatJson
 		case "protobuf":
 			format = SessionFormatProtobuf
-		case "json":
-			fallthrough
-		case "":
-			format = SessionFormatJson
 		default:
 			// Invalid values are rejected.
 			http.Error(w, "Invalid format parameter", 400)
@@ -61,7 +60,7 @@ func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry Sess
 			// Attempt header based authentication.
 			const prefix = "Bearer "
 			if !strings.HasPrefix(auth[0], prefix) {
-				http.Error(w, "Missing or invalid token", 401)
+				http.Error(w, "Missing or invalid token", http.StatusUnauthorized)
 				return
 			}
 			token = auth[0][len(prefix):]
@@ -70,12 +69,12 @@ func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry Sess
 			token = r.URL.Query().Get("token")
 		}
 		if token == "" {
-			http.Error(w, "Missing or invalid token", 401)
+			http.Error(w, "Missing or invalid token", http.StatusUnauthorized)
 			return
 		}
-		userID, username, vars, expiry, _, ok := parseToken([]byte(config.GetSession().EncryptionKey), token)
-		if !ok || !sessionCache.IsValidSession(userID, expiry, token) {
-			http.Error(w, "Missing or invalid token", 401)
+		userID, username, vars, expiry, tokenId, issuedAt, ok := parseToken([]byte(config.GetSession().EncryptionKey), token)
+		if !ok || !sessionCache.IsValidSession(userID, expiry, tokenId) {
+			http.Error(w, "Missing or invalid token", http.StatusUnauthorized)
 			return
 		}
 
@@ -93,15 +92,18 @@ func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry Sess
 			return
 		}
 
-		clientIP, clientPort := extractClientAddressFromRequest(logger, r)
+		clientIP, clientPort := extractClientAddressFromRequest(logger, config, r)
 		status, _ := strconv.ParseBool(r.URL.Query().Get("status"))
 		sessionID := uuid.Must(sessionIdGen.NewV1())
-
 		// Mark the start of the session.
 		metrics.CountWebsocketOpened(1)
+		headers := make(map[string][]string, len(r.Header))
+		for k, v := range r.Header {
+			headers[k] = slices.Clone(v)
+		}
 
 		// Wrap the connection for application handling.
-		session := NewSessionWS(logger, config, format, sessionID, userID, username, vars, expiry, clientIP, clientPort, lang, protojsonMarshaler, protojsonUnmarshaler, conn, sessionRegistry, statusRegistry, matchmaker, tracker, metrics, pipeline, runtime)
+		session := NewSessionWS(logger, config, format, sessionID, userID, username, tokenId, headers, vars, expiry, issuedAt, clientIP, clientPort, lang, protojsonMarshaler, protojsonUnmarshaler, conn, sessionRegistry, statusRegistry, matchmaker, tracker, metrics, pipeline, runtime)
 
 		// Add to the session registry.
 		sessionRegistry.Add(session)
@@ -119,10 +121,10 @@ func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry Sess
 					Stream: PresenceStream{Mode: StreamModeStatus, Subject: userID},
 					Meta:   PresenceMeta{Format: format, Username: username, Status: ""},
 				},
-			}, userID, true)
+			}, userID)
 		} else {
 			// Only notification presence.
-			tracker.Track(session.Context(), sessionID, PresenceStream{Mode: StreamModeNotifications, Subject: userID}, userID, PresenceMeta{Format: format, Username: username, Hidden: true}, true)
+			tracker.Track(session.Context(), sessionID, PresenceStream{Mode: StreamModeNotifications, Subject: userID}, userID, PresenceMeta{Format: format, Username: username, Hidden: true})
 		}
 
 		if config.GetSession().SingleSocket {

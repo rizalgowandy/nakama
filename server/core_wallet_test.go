@@ -17,9 +17,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/stretchr/testify/assert"
 )
@@ -70,19 +72,31 @@ func TestUpdateWalletSingleUser(t *testing.T) {
 	}
 
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 	if err != nil {
 		t.Fatalf("error creating user: %v", err.Error())
 	}
 
-	for _, val := range values {
+	for _, val := range values[:len(values)/2] {
 		_, _, err := nk.WalletUpdate(context.Background(), userID, map[string]int64{"value": val}, nil, true)
 		if err != nil {
 			t.Fatalf("error updating wallet: %v", err.Error())
 		}
 	}
+
+	var wg sync.WaitGroup
+	for _, val := range values[len(values)/2:] {
+		v := val
+		wg.Go(func() {
+			_, _, err := nk.WalletUpdate(context.Background(), userID, map[string]int64{"value": v}, nil, true)
+			if err != nil {
+				panic(fmt.Sprintf("error updating wallet: %v", err.Error()))
+			}
+		})
+	}
+	wg.Wait()
 
 	account, err := GetAccount(context.Background(), logger, db, nil, uuid.FromStringOrNil(userID))
 	if err != nil {
@@ -148,11 +162,11 @@ func TestUpdateWalletMultiUser(t *testing.T) {
 	}
 
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	count := 5
 
 	userIDs := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for range count {
 		userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 		if err != nil {
 			t.Fatalf("error creating user: %v", err.Error())
@@ -235,11 +249,11 @@ func TestUpdateWalletsMultiUser(t *testing.T) {
 	}
 
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	count := 5
 
 	userIDs := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for range count {
 		userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 		if err != nil {
 			t.Fatalf("error creating user: %v", err.Error())
@@ -327,11 +341,11 @@ func TestUpdateWalletsMultiUserSharedChangeset(t *testing.T) {
 	}
 
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	count := 5
 
 	userIDs := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for range count {
 		userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 		if err != nil {
 			t.Fatalf("error creating user: %v", err.Error())
@@ -423,11 +437,11 @@ func TestUpdateWalletsMultiUserSharedChangesetDeductions(t *testing.T) {
 	}
 
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	count := 5
 
 	userIDs := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for range count {
 		userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 		if err != nil {
 			t.Fatalf("error creating user: %v", err.Error())
@@ -478,7 +492,7 @@ func TestUpdateWalletsMultiUserSharedChangesetDeductions(t *testing.T) {
 
 func TestUpdateWalletsSingleUser(t *testing.T) {
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 	if err != nil {
@@ -512,7 +526,7 @@ func TestUpdateWalletsSingleUser(t *testing.T) {
 
 	assert.NotNil(t, account, "account is nil")
 
-	var wallet map[string]interface{}
+	var wallet map[string]any
 	err = json.Unmarshal([]byte(account.Wallet), &wallet)
 	if err != nil {
 		t.Fatalf("json unmarshal error: %v", err.Error())
@@ -525,7 +539,7 @@ func TestUpdateWalletsSingleUser(t *testing.T) {
 
 func TestUpdateWalletRepeatedSingleUser(t *testing.T) {
 	db := NewDB(t)
-	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	nk := NewRuntimeGoNakamaModule(logger, db, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	userID, _, _, err := AuthenticateCustom(context.Background(), logger, db, uuid.Must(uuid.NewV4()).String(), uuid.Must(uuid.NewV4()).String(), true)
 	if err != nil {
@@ -552,7 +566,7 @@ func TestUpdateWalletRepeatedSingleUser(t *testing.T) {
 
 	assert.NotNil(t, account, "account is nil")
 
-	var wallet map[string]interface{}
+	var wallet map[string]any
 	err = json.Unmarshal([]byte(account.Wallet), &wallet)
 	if err != nil {
 		t.Fatalf("json unmarshal error: %v", err.Error())

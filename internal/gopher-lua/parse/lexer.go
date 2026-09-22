@@ -287,7 +287,7 @@ var reservedWords = map[string]int{
 	"end": TEnd, "false": TFalse, "for": TFor, "function": TFunction,
 	"if": TIf, "in": TIn, "local": TLocal, "nil": TNil, "not": TNot, "or": TOr,
 	"return": TReturn, "repeat": TRepeat, "then": TThen, "true": TTrue,
-	"until": TUntil, "while": TWhile}
+	"until": TUntil, "while": TWhile, "goto": TGoto}
 
 func (sc *Scanner) Scan(lexer *Lexer) (ast.Token, error) {
 redo:
@@ -409,7 +409,16 @@ redo:
 				tok.Type = '.'
 			}
 			tok.Str = buf.String()
-		case '+', '*', '/', '%', '^', '#', '(', ')', '{', '}', ']', ';', ':', ',':
+		case ':':
+			if sc.Peek() == ':' {
+				tok.Type = T2Colon
+				tok.Str = "::"
+				sc.Next()
+			} else {
+				tok.Type = ch
+				tok.Str = string(rune(ch))
+			}
+		case '+', '*', '/', '%', '^', '#', '(', ')', '{', '}', ']', ';', ',':
 			tok.Type = ch
 			tok.Str = string(rune(ch))
 		default:
@@ -475,14 +484,14 @@ func Parse(reader io.Reader, name string) (chunk []ast.Stmt, err error) {
 
 func isInlineDumpNode(rv reflect.Value) bool {
 	switch rv.Kind() {
-	case reflect.Struct, reflect.Slice, reflect.Interface, reflect.Ptr:
+	case reflect.Struct, reflect.Slice, reflect.Interface, reflect.Pointer:
 		return false
 	default:
 		return true
 	}
 }
 
-func dump(node interface{}, level int, s string) string {
+func dump(node any, level int, s string) string {
 	rt := reflect.TypeOf(node)
 	if fmt.Sprint(rt) == "<nil>" {
 		return strings.Repeat(s, level) + "<nil>"
@@ -498,7 +507,7 @@ func dump(node interface{}, level int, s string) string {
 		for i := 0; i < rv.Len(); i++ {
 			buf = append(buf, dump(rv.Index(i).Interface(), level, s))
 		}
-	case reflect.Ptr:
+	case reflect.Pointer:
 		vt := rv.Elem()
 		tt := rt.Elem()
 		indicies := []int{}

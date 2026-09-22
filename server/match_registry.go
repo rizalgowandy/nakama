@@ -27,7 +27,7 @@ import (
 
 	"github.com/blugelabs/bluge"
 	"github.com/blugelabs/bluge/index"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -38,8 +38,8 @@ import (
 
 func init() {
 	// Ensure gob can deal with typical types that might be used in match parameters.
-	gob.Register(map[string]interface{}(nil))
-	gob.Register([]interface{}(nil))
+	gob.Register(map[string]any(nil))
+	gob.Register([]any(nil))
 	gob.Register([]runtime.Presence(nil))
 	gob.Register(&Presence{})
 	gob.Register([]runtime.MatchmakerEntry(nil))
@@ -58,12 +58,12 @@ var (
 )
 
 type MatchIndexEntry struct {
-	Node        string                 `json:"node"`
-	Label       map[string]interface{} `json:"label"`
-	LabelString string                 `json:"label_string"`
-	TickRate    int                    `json:"tick_rate"`
-	HandlerName string                 `json:"handler_name"`
-	CreateTime  int64                  `json:"create_time"`
+	Node        string         `json:"node"`
+	Label       map[string]any `json:"label"`
+	LabelString string         `json:"label_string"`
+	TickRate    int            `json:"tick_rate"`
+	HandlerName string         `json:"handler_name"`
+	CreateTime  int64          `json:"create_time"`
 }
 
 type MatchJoinAttemptResult struct {
@@ -86,9 +86,9 @@ type MatchGetStateResult struct {
 
 type MatchRegistry interface {
 	// Create and start a new match, given a Lua module name or registered Go or JS match function.
-	CreateMatch(ctx context.Context, createFn RuntimeMatchCreateFunction, module string, params map[string]interface{}) (string, error)
+	CreateMatch(ctx context.Context, createFn RuntimeMatchCreateFunction, module string, params map[string]any) (string, error)
 	// Register and initialise a match that's ready to run.
-	NewMatch(logger *zap.Logger, id uuid.UUID, core RuntimeMatchCore, stopped *atomic.Bool, params map[string]interface{}) (*MatchHandler, error)
+	NewMatch(logger *zap.Logger, id uuid.UUID, core RuntimeMatchCore, stopped *atomic.Bool, params map[string]any) (*MatchHandler, error)
 	// Return a match by ID.
 	GetMatch(ctx context.Context, id string) (*api.Match, string, error)
 	// Remove a tracked match and ensure all its presences are cleaned up.
@@ -96,6 +96,8 @@ type MatchRegistry interface {
 	RemoveMatch(id uuid.UUID, stream PresenceStream)
 	// Update the label entry for a given match.
 	UpdateMatchLabel(id uuid.UUID, tickRate int, handlerName, label string, createTime int64) error
+	// Clear the match label for a given match.
+	ClearMatchLabel(id uuid.UUID, node string) error
 	// List (and optionally filter) currently running matches.
 	// This can list across both authoritative and relayed matches.
 	ListMatches(ctx context.Context, limit int, authoritative *wrapperspb.BoolValue, label *wrapperspb.StringValue, minSize *wrapperspb.Int32Value, maxSize *wrapperspb.Int32Value, query *wrapperspb.StringValue, node *wrapperspb.StringValue) ([]*api.Match, []string, error)
@@ -112,7 +114,7 @@ type MatchRegistry interface {
 	// Notify a match handler that one or more users have left or disconnected.
 	// Expects that the caller has already determined the match is hosted on the current node.
 	Leave(id uuid.UUID, presences []*MatchPresence)
-	// Called by match handlers to request the removal fo a match participant.
+	// Called by match handlers to request the removal of a match participant.
 	Kick(stream PresenceStream, presences []*MatchPresence)
 	// Pass a data payload (usually from a user) to the appropriate match handler.
 	// Assumes that the data sender has already been validated as a match participant before this call.
@@ -147,7 +149,6 @@ type LocalMatchRegistry struct {
 }
 
 func NewLocalMatchRegistry(logger, startupLogger *zap.Logger, config Config, sessionRegistry SessionRegistry, tracker Tracker, router MessageRouter, metrics Metrics, node string) MatchRegistry {
-
 	cfg := BlugeInMemoryConfig()
 	indexWriter, err := bluge.OpenWriter(cfg)
 	if err != nil {
@@ -224,7 +225,7 @@ func (r *LocalMatchRegistry) processLabelUpdates(batch *index.Batch) {
 	batch.Reset()
 }
 
-func (r *LocalMatchRegistry) CreateMatch(ctx context.Context, createFn RuntimeMatchCreateFunction, module string, params map[string]interface{}) (string, error) {
+func (r *LocalMatchRegistry) CreateMatch(ctx context.Context, createFn RuntimeMatchCreateFunction, module string, params map[string]any) (string, error) {
 	buf := &bytes.Buffer{}
 	if err := gob.NewEncoder(buf).Encode(params); err != nil {
 		return "", runtime.ErrCannotEncodeParams
@@ -254,7 +255,7 @@ func (r *LocalMatchRegistry) CreateMatch(ctx context.Context, createFn RuntimeMa
 	return mh.IDStr, nil
 }
 
-func (r *LocalMatchRegistry) NewMatch(logger *zap.Logger, id uuid.UUID, core RuntimeMatchCore, stopped *atomic.Bool, params map[string]interface{}) (*MatchHandler, error) {
+func (r *LocalMatchRegistry) NewMatch(logger *zap.Logger, id uuid.UUID, core RuntimeMatchCore, stopped *atomic.Bool, params map[string]any) (*MatchHandler, error) {
 	if r.stopped.Load() {
 		// Server is shutting down, reject new matches.
 		return nil, errors.New("shutdown in progress")
@@ -317,7 +318,9 @@ func (r *LocalMatchRegistry) GetMatch(ctx context.Context, id string) (*api.Matc
 }
 
 func (r *LocalMatchRegistry) RemoveMatch(id uuid.UUID, stream PresenceStream) {
-	r.matches.Delete(id)
+	if _, existed := r.matches.LoadAndDelete(id); !existed {
+		return
+	}
 	matchesRemaining := r.matchCount.Dec()
 	r.metrics.GaugeAuthoritativeMatches(float64(matchesRemaining))
 
@@ -344,7 +347,7 @@ func (r *LocalMatchRegistry) UpdateMatchLabel(id uuid.UUID, tickRate int, handle
 	if len(label) > MatchLabelMaxBytes {
 		return runtime.ErrMatchLabelTooLong
 	}
-	var labelJSON map[string]interface{}
+	var labelJSON map[string]any
 	// Doesn't matter if this is not JSON.
 	_ = json.Unmarshal([]byte(label), &labelJSON)
 
@@ -365,6 +368,15 @@ func (r *LocalMatchRegistry) UpdateMatchLabel(id uuid.UUID, tickRate int, handle
 	return nil
 }
 
+func (r *LocalMatchRegistry) ClearMatchLabel(id uuid.UUID, node string) error {
+	idStr := fmt.Sprintf("%v.%v", id.String(), node)
+	r.pendingUpdatesMutex.Lock()
+	r.pendingUpdates[idStr] = nil
+	r.pendingUpdatesMutex.Unlock()
+
+	return nil
+}
+
 func (r *LocalMatchRegistry) ListMatches(ctx context.Context, limit int, authoritative *wrapperspb.BoolValue, label *wrapperspb.StringValue, minSize *wrapperspb.Int32Value, maxSize *wrapperspb.Int32Value, queryString *wrapperspb.StringValue, node *wrapperspb.StringValue) ([]*api.Match, []string, error) {
 	if limit == 0 {
 		return make([]*api.Match, 0), make([]string, 0), nil
@@ -375,8 +387,7 @@ func (r *LocalMatchRegistry) ListMatches(ctx context.Context, limit int, authori
 		return nil, nil, fmt.Errorf("error accessing index reader: %v", err.Error())
 	}
 	defer func() {
-		err = indexReader.Close()
-		if err != nil {
+		if err = indexReader.Close(); err != nil {
 			r.logger.Error("error closing index reader", zap.Error(err))
 		}
 	}()
@@ -886,7 +897,7 @@ func MapMatchIndexEntry(id string, in *MatchIndexEntry) (*bluge.Document, error)
 	rv.AddField(bluge.NewNumericField("create_time", float64(in.CreateTime)).StoreValue())
 
 	if in.Label != nil {
-		BlugeWalkDocument(in.Label, []string{"label"}, rv)
+		BlugeWalkDocument(in.Label, []string{"label"}, map[string]bool{}, rv)
 	}
 
 	return rv, nil
